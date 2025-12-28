@@ -17,9 +17,17 @@ public:
         auto match = end();
         for (auto it = beginIt; it != endIt; ++it)
         {
-            if (address < it->address || address >= it->address + it->size)
+            // For symbols with size = 0, only match exact address
+            // For symbols with size > 0, check if address falls within [address, address + size)
+            if (it->size == 0)
             {
-                continue;
+                if (address != it->address)
+                    continue;
+            }
+            else
+            {
+                if (address < it->address || address >= it->address + it->size)
+                    continue;
             }
 
             const size_t distance = address - it->address;
@@ -45,9 +53,17 @@ public:
         auto match = end();
         for (auto it = beginIt; it != endIt; ++it)
         {
-            if (address < it->address || address >= it->address + it->size)
+            // For symbols with size = 0, only match exact address
+            // For symbols with size > 0, check if address falls within [address, address + size)
+            if (it->size == 0)
             {
-                continue;
+                if (address != it->address)
+                    continue;
+            }
+            else
+            {
+                if (address < it->address || address >= it->address + it->size)
+                    continue;
             }
 
             const size_t distance = address - it->address;

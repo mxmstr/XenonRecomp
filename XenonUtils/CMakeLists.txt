@@ -1,8 +1,10 @@
 project("XenonUtils")
 
 add_library(XenonUtils
-    "disasm.cpp" 
+    "disasm.cpp"
+    "disasm_x86.cpp"
     "xex.cpp" 
+    "xbe.cpp"
     "image.cpp" 
     "xdbf_wrapper.cpp"
     "xex_patcher.cpp"
@@ -29,4 +31,5 @@ target_include_directories(XenonUtils
 target_link_libraries(XenonUtils 
     PUBLIC
         disasm
+        fmt::fmt
 )

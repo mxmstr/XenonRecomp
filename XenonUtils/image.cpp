@@ -1,6 +1,7 @@
 #include "image.h"
 #include "elf.h"
 #include "xex.h"
+#include "xbe.h"
 #include <cassert>
 #include <cstring>
 
@@ -38,6 +39,10 @@ Image Image::ParseImage(const uint8_t* data, size_t size)
     else if (data[0] == 'X' && data[1] == 'E' && data[2] == 'X' && data[3] == '2')
     {
         return Xex2LoadImage(data, size);
+    }
+    else if (data[0] == 'X' && data[1] == 'B' && data[2] == 'E' && data[3] == 'H')
+    {
+        return XbeLoadImage(data, size);
     }
 
     return {};
