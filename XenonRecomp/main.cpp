@@ -60,11 +60,14 @@ int main(int argc, char* argv[])
     if (argc < 3)
     {
         printf("XenonRecomp - Xbox 360/Original Xbox static recompiler\n\n");
-        printf("Usage: XenonRecomp [input TOML file path] [context header file path]\n\n");
+        printf("Usage: XenonRecomp [input TOML file path] [context header file path] [options]\n\n");
         printf("Arguments:\n");
         printf("  TOML file      - Configuration file for the recompiler\n");
         printf("  context header - For XEX files: ppc_context.h\n");
         printf("                   For XBE files: x86_context.h\n\n");
+        printf("Options:\n");
+        printf("  --function <address>  - Recompile only a single function at the given address\n");
+        printf("                          Address should be in hex format (e.g., 0x24C05C)\n\n");
         printf("The executable type (XEX/XBE) is auto-detected from the TOML config.\n");
         return EXIT_SUCCESS;
     }
@@ -77,6 +80,25 @@ int main(int argc, char* argv[])
         argv[1]
     #endif
         ;
+
+    // Parse optional --function argument
+    uint32_t singleFunctionAddress = 0;
+    for (int i = 3; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--function") == 0 && i + 1 < argc)
+        {
+            // Parse hex address
+            char* endPtr;
+            singleFunctionAddress = strtoul(argv[i + 1], &endPtr, 0);
+            if (*endPtr != '\0')
+            {
+                fmt::println("Error: Invalid function address '{}'", argv[i + 1]);
+                return EXIT_FAILURE;
+            }
+            fmt::println("Recompiling single function at address: 0x{:X}", singleFunctionAddress);
+            i++; // Skip address argument
+        }
+    }
 
     if (std::filesystem::is_regular_file(path))
     {
@@ -98,6 +120,7 @@ int main(int argc, char* argv[])
             if (!recompiler.LoadConfig(path))
                 return -1;
 
+            recompiler.config.singleFunctionAddress = singleFunctionAddress;
             recompiler.Analyse();
 
             auto entry = recompiler.image.symbols.find(recompiler.image.entry_point);
@@ -122,6 +145,7 @@ int main(int argc, char* argv[])
             if (!recompiler.LoadConfig(path))
                 return -1;
 
+            recompiler.config.singleFunctionAddress = singleFunctionAddress;
             recompiler.Analyse();
 
             auto entry = recompiler.image.symbols.find(recompiler.image.entry_point);

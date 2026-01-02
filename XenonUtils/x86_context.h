@@ -1256,7 +1256,7 @@ inline uint32_t x86_lea(uint32_t base, uint32_t index, uint32_t scale, int32_t d
 }
 
 // String operation helpers
-inline void x86_movsb(X86Context& ctx) noexcept
+inline void x86_movsb(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx);
     X86_STORE_U8(X86_REG_EDI(ctx), X86_LOAD_U8(X86_REG_ESI(ctx)));
@@ -1264,7 +1264,7 @@ inline void x86_movsb(X86Context& ctx) noexcept
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_movsw(X86Context& ctx) noexcept
+inline void x86_movsw(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 2;
     X86_STORE_U16(X86_REG_EDI(ctx), X86_LOAD_U16(X86_REG_ESI(ctx)));
@@ -1272,7 +1272,7 @@ inline void x86_movsw(X86Context& ctx) noexcept
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_movsd(X86Context& ctx) noexcept
+inline void x86_movsd(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 4;
     X86_STORE_U32(X86_REG_EDI(ctx), X86_LOAD_U32(X86_REG_ESI(ctx)));
@@ -1280,49 +1280,49 @@ inline void x86_movsd(X86Context& ctx) noexcept
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_stosb(X86Context& ctx) noexcept
+inline void x86_stosb(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx);
     X86_STORE_U8(X86_REG_EDI(ctx), static_cast<uint8_t>(X86_REG_EAX(ctx)));
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_stosw(X86Context& ctx) noexcept
+inline void x86_stosw(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 2;
     X86_STORE_U16(X86_REG_EDI(ctx), static_cast<uint16_t>(X86_REG_EAX(ctx)));
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_stosd(X86Context& ctx) noexcept
+inline void x86_stosd(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 4;
     X86_STORE_U32(X86_REG_EDI(ctx), X86_REG_EAX(ctx));
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_lodsb(X86Context& ctx) noexcept
+inline void x86_lodsb(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx);
     X86_REG_AL(ctx) = X86_LOAD_U8(X86_REG_ESI(ctx));
     X86_REG_ESI(ctx) += dir;
 }
 
-inline void x86_lodsw(X86Context& ctx) noexcept
+inline void x86_lodsw(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 2;
     X86_REG_AX(ctx) = X86_LOAD_U16(X86_REG_ESI(ctx));
     X86_REG_ESI(ctx) += dir;
 }
 
-inline void x86_lodsd(X86Context& ctx) noexcept
+inline void x86_lodsd(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 4;
     X86_REG_EAX(ctx) = X86_LOAD_U32(X86_REG_ESI(ctx));
     X86_REG_ESI(ctx) += dir;
 }
 
-inline void x86_scasb(X86Context& ctx) noexcept
+inline void x86_scasb(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx);
     uint8_t val = X86_LOAD_U8(X86_REG_EDI(ctx));
@@ -1330,7 +1330,7 @@ inline void x86_scasb(X86Context& ctx) noexcept
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_scasw(X86Context& ctx) noexcept
+inline void x86_scasw(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 2;
     uint16_t val = X86_LOAD_U16(X86_REG_EDI(ctx));
@@ -1338,7 +1338,7 @@ inline void x86_scasw(X86Context& ctx) noexcept
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_scasd(X86Context& ctx) noexcept
+inline void x86_scasd(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 4;
     uint32_t val = X86_LOAD_U32(X86_REG_EDI(ctx));
@@ -1346,7 +1346,7 @@ inline void x86_scasd(X86Context& ctx) noexcept
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_cmpsb(X86Context& ctx) noexcept
+inline void x86_cmpsb(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx);
     uint8_t src = X86_LOAD_U8(X86_REG_ESI(ctx));
@@ -1356,7 +1356,7 @@ inline void x86_cmpsb(X86Context& ctx) noexcept
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_cmpsw(X86Context& ctx) noexcept
+inline void x86_cmpsw(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 2;
     uint16_t src = X86_LOAD_U16(X86_REG_ESI(ctx));
@@ -1366,7 +1366,7 @@ inline void x86_cmpsw(X86Context& ctx) noexcept
     X86_REG_EDI(ctx) += dir;
 }
 
-inline void x86_cmpsd(X86Context& ctx) noexcept
+inline void x86_cmpsd(X86Context& ctx, uint8_t* base) noexcept
 {
     int dir = X86_STRING_DIRECTION(ctx) * 4;
     uint32_t src = X86_LOAD_U32(X86_REG_ESI(ctx));

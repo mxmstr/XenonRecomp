@@ -50,6 +50,7 @@ struct RecompilerConfig
     uint32_t longJmpAddress = 0;
     uint32_t setJmpAddress = 0;
     std::unordered_map<uint32_t, uint32_t> functions;
+    uint32_t singleFunctionAddress = 0;  // Single function recompilation (0 = recompile all)
     std::unordered_map<uint32_t, uint32_t> invalidInstructions;
     std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
 

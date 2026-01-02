@@ -2,6 +2,7 @@
 #include <disasm_x86.h>
 #include <algorithm>
 #include <set>
+#include <fmt/core.h>
 
 Function AnalyzeX86Function(const void* code, size_t maxSize, uint32_t base)
 {
@@ -64,9 +65,16 @@ Function AnalyzeX86Function(const void* code, size_t maxSize, uint32_t base)
             if (insn.type == x86::InsnType::Jcc)
             {
                 // Conditional branch - follow both paths
+                // But only if target is reasonably close (within 4KB)
+                // Far jumps are likely tail calls to function chunks
                 if (insn.branch_target >= base && insn.branch_target < base + maxSize)
                 {
-                    pending.push_back(insn.branch_target);
+                    int64_t distance = static_cast<int64_t>(insn.branch_target) - static_cast<int64_t>(curAddr);
+                    if (distance > -4096 && distance < 4096)
+                    {
+                        pending.push_back(insn.branch_target);
+                    }
+                    // Far conditional jumps still have fall-through, so continue
                 }
                 // Continue to next instruction (fall-through)
                 p += len;
@@ -74,11 +82,18 @@ Function AnalyzeX86Function(const void* code, size_t maxSize, uint32_t base)
             else if (insn.type == x86::InsnType::Jmp)
             {
                 // Unconditional jump
+                // Only follow if target is reasonably close (within 4KB)
+                // Far jumps are likely tail calls or jumps to function chunks
                 if (insn.is_branch_relative && 
                     insn.branch_target >= base && 
                     insn.branch_target < base + maxSize)
                 {
-                    pending.push_back(insn.branch_target);
+                    int64_t distance = static_cast<int64_t>(insn.branch_target) - static_cast<int64_t>(curAddr);
+                    if (distance > -4096 && distance < 4096)
+                    {
+                        pending.push_back(insn.branch_target);
+                    }
+                    // Far unconditional jumps are tail calls - don't follow
                 }
                 break; // End of this path
             }
@@ -233,6 +248,27 @@ static bool IsPotentialFunctionStart(const uint8_t* p, const uint8_t* dataEnd, c
                 return true;
             }
         }
+        
+        // Also check for push followed by 2+ more pushes (common prologue pattern)
+        // push ebx; push ebx; push ebx... or push ebx; push esi; push edi
+        if (p + 2 < dataEnd)
+        {
+            int pushCount = 1;
+            for (int i = 1; i < 6 && p + i < dataEnd; i++)
+            {
+                uint8_t next = p[i];
+                if (next >= 0x50 && next <= 0x57) // push eax-edi
+                    pushCount++;
+                else
+                    break;
+            }
+            // 3+ consecutive pushes is a strong indicator of function start
+            if (pushCount >= 3)
+            {
+                return true;
+            }
+        }
+        
         return false;  // Don't trust single push reg after arbitrary byte
     }
     
@@ -320,9 +356,26 @@ std::vector<uint32_t> FindX86Functions(const void* code, size_t size, uint32_t b
         foundFunctions.insert(target);
     }
     
-    // NOTE: We intentionally do NOT scan for prologue patterns.
-    // Functions that are only called indirectly (vtables, function pointers)
-    // will need to be manually added to the TOML config file.
+    // Second pass: scan for function prologues to catch functions only called indirectly
+    // (via vtables, function pointers, etc.)
+    // Only add functions that start AFTER a clear boundary (ret, int3 padding, etc.)
+    p = data;
+    addr = base;
+    while (p < dataEnd)
+    {
+        if (IsPotentialFunctionStart(p, dataEnd, data))
+        {
+            foundFunctions.insert(addr);
+            // Skip ahead to avoid detecting same function multiple times
+            p++;
+            addr++;
+        }
+        else
+        {
+            p++;
+            addr++;
+        }
+    }
     
     // Convert to sorted vector
     functions.assign(foundFunctions.begin(), foundFunctions.end());
@@ -537,4 +590,68 @@ void ReadX86JumpTable(X86SwitchTable& table, const uint8_t* imageBase, uint32_t 
             break;
         }
     }
+}
+
+std::vector<uint32_t> FindX86VtableFunctions(const void* data, size_t size, uint32_t base,
+                                              uint32_t codeStart, uint32_t codeEnd)
+{
+    std::set<uint32_t> functions;
+    const uint32_t* dwords = static_cast<const uint32_t*>(data);
+    size_t count = size / 4;
+    
+    // Scan the data section for sequences of code pointers
+    // A vtable is typically:
+    // 1. An array of 2+ consecutive dwords that are valid code addresses
+    // 2. Often starts at an aligned address (4, 8, or 16 byte aligned)
+    // 3. May contain NULL entries for pure virtual functions
+    
+    size_t consecutiveCodePtrs = 0;
+    std::vector<uint32_t> currentVtable;
+    
+    for (size_t i = 0; i < count; i++)
+    {
+        uint32_t value = dwords[i];  // x86 is little-endian, no swap needed
+        
+        // Check if this looks like a code pointer
+        bool isCodePtr = (value >= codeStart && value < codeEnd);
+        
+        // Also allow NULL (0) for pure virtual entries, but only if we're already in a vtable
+        bool isNull = (value == 0);
+        
+        if (isCodePtr)
+        {
+            currentVtable.push_back(value);
+            consecutiveCodePtrs++;
+        }
+        else if (isNull && consecutiveCodePtrs >= 2)
+        {
+            // NULL in the middle of a vtable - skip but don't break
+            consecutiveCodePtrs++;
+        }
+        else
+        {
+            // End of potential vtable
+            if (consecutiveCodePtrs >= 2)
+            {
+                // This looks like a vtable - add all non-null entries as functions
+                for (uint32_t ptr : currentVtable)
+                {
+                    functions.insert(ptr);
+                }
+            }
+            currentVtable.clear();
+            consecutiveCodePtrs = 0;
+        }
+    }
+    
+    // Don't forget the last vtable if file ends with one
+    if (consecutiveCodePtrs >= 2)
+    {
+        for (uint32_t ptr : currentVtable)
+        {
+            functions.insert(ptr);
+        }
+    }
+    
+    return std::vector<uint32_t>(functions.begin(), functions.end());
 }

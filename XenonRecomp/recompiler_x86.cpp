@@ -62,6 +62,37 @@ void X86Recompiler::Analyse()
         functions.emplace_back(address, size);
         image.symbols.emplace(fmt::format("sub_{:X}", address), address, size, Symbol_Function);
     }
+    
+    if (!config.functions.empty())
+    {
+        fmt::println("Loaded {} manually-specified functions from TOML:", config.functions.size());
+        // for (auto& [address, size] : config.functions)
+        // {
+        //     fmt::println("  0x{:X} (size: 0x{:X})", address, size);
+        // }
+    }
+
+    // Helper to check if an address falls within a manually-specified function
+    auto isInManualFunction = [&](uint32_t addr) -> bool {
+        for (const auto& [fnAddr, fnSize] : config.functions)
+        {
+            if (addr >= fnAddr && addr < fnAddr + fnSize)
+                return true;
+        }
+        return false;
+    };
+
+    // Helper to check if an address is close to a manually-specified function start
+    // (within 16 bytes - likely a misdetection of the same function)
+    auto isNearManualFunction = [&](uint32_t addr) -> bool {
+        for (const auto& [fnAddr, fnSize] : config.functions)
+        {
+            // Check if addr is within 16 bytes before or after the manual function start
+            if (addr >= fnAddr - 16 && addr < fnAddr + 16)
+                return true;
+        }
+        return false;
+    };
 
     // Build a map of section data for quick lookup
     struct SectionInfo {
@@ -330,7 +361,7 @@ void X86Recompiler::Analyse()
                 }
             }
             
-            if (isPotentialEntry && !callTargets.count(addr) && !validInsnAddrs.count(addr))
+            if (isPotentialEntry && !callTargets.count(addr) && !validInsnAddrs.count(addr) && !isInManualFunction(addr) && !isNearManualFunction(addr))
             {
                 // Verify this isn't inside an instruction we already decoded
                 bool insideKnownInsn = false;
@@ -381,7 +412,7 @@ void X86Recompiler::Analyse()
             
             // Check if this value points to a code section
             const SectionInfo* targetSec = getSectionForAddr(value);
-            if (targetSec && !callTargets.count(value) && !additionalCallTargets.count(value))
+            if (targetSec && !callTargets.count(value) && !additionalCallTargets.count(value) && !isInManualFunction(value) && !isNearManualFunction(value))
             {
                 // Additional validation: try to disassemble at the target
                 const uint8_t* p = targetSec->data + (value - targetSec->base);
@@ -484,10 +515,10 @@ void X86Recompiler::Analyse()
 
     fmt::println("Phase 3: Total {} call targets after validation", callTargets.size());
 
-    // Add all validated call targets as functions
+    // Add all validated call targets as functions, unless they're inside/near manually-specified functions
     for (uint32_t target : callTargets)
     {
-        if (image.symbols.find(target) == image.symbols.end())
+        if (image.symbols.find(target) == image.symbols.end() && !isInManualFunction(target) && !isNearManualFunction(target))
         {
             auto& fn = functions.emplace_back();
             fn.base = target;
@@ -634,7 +665,9 @@ void X86Recompiler::Analyse()
                 uint32_t target = insn.branch_target;
                 if (getSectionForAddr(target) && 
                     !existingFunctions.count(target) &&
-                    !missingFunctions.count(target))
+                    !missingFunctions.count(target) &&
+                    !isInManualFunction(target) &&
+                    !isNearManualFunction(target))
                 {
                     missingFunctions.insert(target);
                 }
@@ -651,7 +684,9 @@ void X86Recompiler::Analyse()
                 {
                     if (getSectionForAddr(target) && 
                         !existingFunctions.count(target) &&
-                        !missingFunctions.count(target))
+                        !missingFunctions.count(target) &&
+                        !isInManualFunction(target) &&
+                        !isNearManualFunction(target))
                     {
                         missingFunctions.insert(target);
                     }
@@ -717,6 +752,13 @@ void X86Recompiler::Analyse()
     {
         std::map<uint32_t, uint32_t> addrToFunc;  // Maps address to function that covers it
         
+        // Build a set of all function entry points - jumps to these are tail calls, not internal flow
+        std::set<uint32_t> functionEntryPoints;
+        for (const auto& fn : functions)
+        {
+            functionEntryPoints.insert(fn.base);
+        }
+        
         // First, calculate coverage for each function (all bytes within all reachable instructions)
         for (const auto& fn : functions)
         {
@@ -731,6 +773,11 @@ void X86Recompiler::Analyse()
             {
                 uint32_t addr = workList.back();
                 workList.pop_back();
+                
+                // Don't follow control flow into OTHER functions (tail calls)
+                // But DO process our own entry point
+                if (addr != fn.base && functionEntryPoints.count(addr))
+                    continue;
                 
                 if (visitedInsns.count(addr) || addr < sec->base || addr >= sec->base + sec->size)
                     continue;
@@ -763,6 +810,11 @@ void X86Recompiler::Analyse()
                 }
                 else if (insn.type == x86::InsnType::JmpIndirect)
                 {
+                    // JmpIndirect is ALWAYS a terminator - execution never falls through
+                    // This handles both:
+                    // 1. Switch tables (jmp dword ptr [reg*4 + tableAddr]) - targets added to worklist
+                    // 2. Import jumps (jmp dword ptr [import_addr]) - no fallthrough to next insn
+                    
                     // Try to detect and read switch table for reachability
                     // Pattern: jmp dword ptr [reg*4 + tableAddr]
                     const auto& op = insn.op[0];
@@ -832,6 +884,12 @@ void X86Recompiler::Analyse()
                             }
                         }
                     }
+                    // NOTE: JmpIndirect does NOT add addr + len - control never falls through
+                }
+                else if (insn.type == x86::InsnType::Jmp)
+                {
+                    // Non-relative Jmp (call reg, call [mem]) - also a terminator
+                    // The target is unknown at static analysis time, so don't add fallthrough
                 }
                 else if (insn.type != x86::InsnType::Ret && 
                          insn.type != x86::InsnType::Int3)
@@ -842,19 +900,29 @@ void X86Recompiler::Analyse()
         }
         
         // Remove functions whose start address is reachable from an earlier function
+        // EXCEPT for manually-specified functions from TOML - always keep those
         std::vector<Function> filteredFunctions;
         size_t removed = 0;
         
         for (const auto& fn : functions)
         {
+            // Check if this is a manually-specified function
+            bool isManualFunction = config.functions.find(fn.base) != config.functions.end();
+            
             auto it = addrToFunc.find(fn.base);
-            if (it != addrToFunc.end() && it->second < fn.base)
+            if (!isManualFunction && it != addrToFunc.end() && it->second < fn.base)
             {
                 // This function's start is reachable from an earlier function
+                // and it's not manually specified, so remove it
                 removed++;
+                fmt::println("  Removing false positive: 0x{:X} (covered by 0x{:X})", fn.base, it->second);
                 auto symIt = image.symbols.find(fn.base);
                 if (symIt != image.symbols.end())
                     image.symbols.erase(symIt);
+            }
+            else if (isManualFunction && it != addrToFunc.end() && it->second < fn.base)
+            {
+                fmt::println("  Keeping manual function 0x{:X} despite coverage by 0x{:X}", fn.base, it->second);
             }
             else
             {
@@ -979,7 +1047,40 @@ void X86Recompiler::Analyse()
         }
     }
 
+    // Build the functionEntryPoints set for tail call detection during recompilation
+    functionEntryPoints.clear();
+    for (const auto& fn : functions)
+    {
+        functionEntryPoints.insert(fn.base);
+    }
+
     fmt::println("Found {} functions", functions.size());
+    
+    // Verify all manual functions are present
+    // if (!config.functions.empty())
+    // {
+    //     fmt::println("\nVerifying manual functions:");
+    //     for (const auto& [addr, size] : config.functions)
+    //     {
+    //         bool found = false;
+    //         for (const auto& fn : functions)
+    //         {
+    //             if (fn.base == addr)
+    //             {
+    //                 found = true;
+    //                 break;
+    //             }
+    //         }
+    //         if (found)
+    //         {
+    //             fmt::println("  ✓ 0x{:X} present", addr);
+    //         }
+    //         else
+    //         {
+    //             fmt::println("  ✗ 0x{:X} MISSING - this function was removed during analysis!", addr);
+    //         }
+    //     }
+    // }
 }
 
 std::string X86Recompiler::FormatOperand(const x86::Operand& op, int size, X86RecompilerLocalVariables& locals)
@@ -1387,7 +1488,9 @@ bool X86Recompiler::RecompileInstruction(
     const uint8_t* data,
     std::unordered_map<uint32_t, X86RecompilerSwitchTable>::iterator& switchTable,
     X86RecompilerLocalVariables& localVariables,
-    bool needsFallThroughLabel)
+    bool needsFallThroughLabel,
+    uint32_t effectiveBase,
+    uint32_t effectiveEnd)
 {
     // Print instruction as comment
     print("\t// {:08X}: ", address);
@@ -1395,8 +1498,48 @@ bool X86Recompiler::RecompileInstruction(
         print("{:02X} ", data[i]);
     println("");
 
-    auto printFunctionCall = [&](uint32_t target)
+    auto printFunctionCall = [&, address](uint32_t target)
     {
+        // Check if target is within current function (call to a label, not a function)
+        // Use TOML-specified function size as the true boundary, not just effectiveEnd
+        // (effectiveEnd may be smaller if SEH handlers aren't reached via normal control flow)
+        uint32_t functionSize = fn.size;
+        auto tomlIt = config.functions.find(fn.base);
+        if (tomlIt != config.functions.end())
+        {
+            functionSize = tomlIt->second;
+        }
+        uint32_t tomlEnd = fn.base + functionSize;
+        
+        // Check if target is in main function body
+        bool isInMainBody = (target >= fn.base && target < tomlEnd);
+        
+        // Check if target is in a function chunk
+        bool isInChunk = false;
+        auto chunksIt = config.functionChunks.find(fn.base);
+        if (chunksIt != config.functionChunks.end())
+        {
+            for (const auto& [chunkAddr, chunkSize] : chunksIt->second)
+            {
+                if (target >= chunkAddr && target < chunkAddr + chunkSize)
+                {
+                    isInChunk = true;
+                    break;
+                }
+            }
+        }
+        
+        if (isInMainBody || isInChunk)
+        {
+            // This is a call to a label within the current function or its chunks
+            // Push return address and goto the label
+            localVariables.esp = true;
+            println("\tctx.esp.u32 -= 4;");
+            println("\tX86_STORE_U32(ctx.esp.u32, 0x{:X});", address + insn.length); // Return address
+            println("\tgoto loc_{:X};", target);
+            return;
+        }
+        
         auto targetSymbol = image.symbols.find(target);
         if (targetSymbol != image.symbols.end() && targetSymbol->address == target && targetSymbol->type == Symbol_Function)
         {
@@ -1431,13 +1574,50 @@ bool X86Recompiler::RecompileInstruction(
 
     auto printConditionalJump = [&](const char* cond, uint32_t target)
     {
-        if (target < fn.base || target >= fn.base + fn.size)
+        // Check if target is in a function chunk
+        bool isInChunk = false;
+        auto chunksIt = config.functionChunks.find(fn.base);
+        if (chunksIt != config.functionChunks.end())
         {
-            // Jump outside function - treat as tail call or error
-            println("\tif ({}) {{", cond);
-            printFunctionCall(target);
-            println("\t\treturn;");
-            println("\t}}");
+            for (const auto& [chunkAddr, chunkSize] : chunksIt->second)
+            {
+                if (target >= chunkAddr && target < chunkAddr + chunkSize)
+                {
+                    isInChunk = true;
+                    break;
+                }
+            }
+        }
+        
+        // Check if target is outside effective function range OR is another function's entry (tail call)
+        bool isTailCall = (target < effectiveBase || target >= effectiveEnd) && !isInChunk;
+        if (!isTailCall && functionEntryPoints.count(target) && target != fn.base && !isInChunk)
+        {
+            // Target is within "function range" but is actually another function - tail call
+            isTailCall = true;
+        }
+        
+        if (isTailCall)
+        {
+            // Jump outside function - need to verify target is actually a function
+            if (functionEntryPoints.count(target))
+            {
+                // Target is a known function entry - emit tail call
+                println("\tif ({}) {{", cond);
+                printFunctionCall(target);
+                println("\t\treturn;");
+                println("\t}}");
+            }
+            else
+            {
+                // Target is not a function entry - this is likely a function chunk
+                // that wasn't detected. Emit the call with a warning.
+                println("\tif ({}) {{", cond);
+                printFunctionCall(target);
+                println("\t// WARNING: Function chunk at {:X} - may need manual verification", target);
+                println("\t\treturn;");
+                println("\t}}");
+            }
         }
         else
         {
@@ -2415,13 +2595,13 @@ bool X86Recompiler::RecompileInstruction(
         if (insn.hasRepPrefix)
         {
             println("\twhile (ctx.ecx.u32 > 0) {{");
-            println("\t\t{}(ctx);", funcName);
+            println("\t\t{}(ctx, base);", funcName);
             println("\t\tctx.ecx.u32--;");
             println("\t}}");
         }
         else
         {
-            println("\t{}(ctx);", funcName);
+            println("\t{}(ctx, base);", funcName);
         }
         break;
     }
@@ -2447,7 +2627,30 @@ bool X86Recompiler::RecompileInstruction(
     case x86::InsnType::Jmp:
         if (insn.is_branch_relative)
         {
-            if (insn.branch_target < fn.base || insn.branch_target >= fn.base + fn.size)
+            // Check if target is in a function chunk
+            bool isInChunk = false;
+            auto chunksIt = config.functionChunks.find(fn.base);
+            if (chunksIt != config.functionChunks.end())
+            {
+                for (const auto& [chunkAddr, chunkSize] : chunksIt->second)
+                {
+                    if (insn.branch_target >= chunkAddr && insn.branch_target < chunkAddr + chunkSize)
+                    {
+                        isInChunk = true;
+                        break;
+                    }
+                }
+            }
+            
+            // Check if target is outside effective function range OR is another function's entry (tail call)
+            bool isTailCall = (insn.branch_target < effectiveBase || insn.branch_target >= effectiveEnd) && !isInChunk;
+            if (!isTailCall && functionEntryPoints.count(insn.branch_target) && insn.branch_target != fn.base && !isInChunk)
+            {
+                // Target is within "function range" but is actually another function - tail call
+                isTailCall = true;
+            }
+            
+            if (isTailCall)
             {
                 // Tail call
                 printFunctionCall(insn.branch_target);
@@ -2481,7 +2684,7 @@ bool X86Recompiler::RecompileInstruction(
             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
             {
                 auto label = switchTable->second.labels[i];
-                if (label < fn.base || label >= fn.base + fn.size)
+                if (label < effectiveBase || label >= effectiveEnd)
                 {
                     println("\tcase {}:", i);
                     println("\t\t// ERROR: Switch case {:X} jumps outside function", label);
@@ -5161,19 +5364,85 @@ bool X86Recompiler::RecompileInstruction(
     return true;
 }
 
-std::vector<X86BasicBlock> X86Recompiler::AnalyzeControlFlow(const Function& fn, const Section* section)
+X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Function& fn, const Section* section)
 {
     std::vector<X86BasicBlock> blocks;
     std::set<uint32_t> blockStarts;
     std::set<uint32_t> visited;
     std::vector<uint32_t> workList;
 
-    const uint8_t* fnData = section->data + (fn.base - section->base);
-    const uint8_t* fnEnd = fnData + fn.size;
+    // Debug: Check if this function is in TOML config
+    auto tomlIt = config.functions.find(fn.base);
+    if (tomlIt != config.functions.end())
+    {
+        fmt::println("DEBUG AnalyzeControlFlow: fn.base=0x{:X}, fn.size=0x{:X} (from param), TOML size=0x{:X}", 
+            fn.base, fn.size, tomlIt->second);
+        if (fn.size != tomlIt->second)
+        {
+            fmt::println("WARNING: fn.size mismatch! Using TOML size.");
+        }
+    }
+
+    // Check for function chunks
+    auto chunksIt = config.functionChunks.find(fn.base);
+    bool hasChunks = (chunksIt != config.functionChunks.end() && !chunksIt->second.empty());
+    
+    // Build a set of addresses that belong to this function (including chunks)
+    std::set<std::pair<uint32_t, uint32_t>> functionRanges;  // {start, end} pairs
+    functionRanges.insert({fn.base, fn.base + fn.size});
+    
+    if (hasChunks)
+    {
+        fmt::println("Function 0x{:X} has {} chunks:", fn.base, chunksIt->second.size());
+        for (const auto& [chunkAddr, chunkSize] : chunksIt->second)
+        {
+            fmt::println("  Chunk: 0x{:X} - 0x{:X} (size 0x{:X})", chunkAddr, chunkAddr + chunkSize, chunkSize);
+            functionRanges.insert({chunkAddr, chunkAddr + chunkSize});
+        }
+    }
+    
+    // Helper to check if an address belongs to this function (main body or chunks)
+    auto isInFunctionRange = [&](uint32_t addr) -> bool {
+        for (const auto& [start, end] : functionRanges)
+        {
+            if (addr >= start && addr < end)
+                return true;
+        }
+        return false;
+    };
+    
+    // Helper to get section for an address
+    auto getSectionForAddress = [&](uint32_t addr) -> const Section* {
+        for (const auto& sec : image.sections)
+        {
+            if (addr >= sec.base && addr < sec.base + sec.size)
+                return &sec;
+        }
+        return nullptr;
+    };
+
+    // Track effective bounds - may extend beyond fn.base/fn.size due to backward jumps
+    uint32_t effectiveBase = fn.base;
+    uint32_t effectiveEnd = fn.base + fn.size;
 
     // Function entry is a block start
     blockStarts.insert(fn.base);
     workList.push_back(fn.base);
+    
+    // Add chunk entry points to worklist
+    if (hasChunks)
+    {
+        for (const auto& [chunkAddr, chunkSize] : chunksIt->second)
+        {
+            blockStarts.insert(chunkAddr);
+            workList.push_back(chunkAddr);
+        }
+    }
+
+    // Helper to check if an address is within section bounds (any section)
+    auto isInSection = [&](uint32_t addr) {
+        return getSectionForAddress(addr) != nullptr;
+    };
 
     // First pass: identify all block start addresses
     while (!workList.empty())
@@ -5181,17 +5450,70 @@ std::vector<X86BasicBlock> X86Recompiler::AnalyzeControlFlow(const Function& fn,
         uint32_t addr = workList.back();
         workList.pop_back();
 
-        if (visited.count(addr) || addr < fn.base || addr >= fn.base + fn.size)
+        // Skip if already visited
+        if (visited.count(addr))
             continue;
+        
+        // Get section for this address (may be different for chunks)
+        const Section* addrSection = getSectionForAddress(addr);
+        if (!addrSection)
+            continue;
+
+        // Check if this is outside current effective bounds and not a chunk
+        if (addr < effectiveBase || addr >= effectiveEnd)
+        {
+            // Allow if it's in a function chunk range
+            if (!isInFunctionRange(addr))
+            {
+                // For addresses outside fn bounds, only follow if not another function's entry
+                if (functionEntryPoints.count(addr) && addr != fn.base)
+                    continue;  // Don't cross into other functions
+            }
+            
+            // Extend effective bounds (note: chunks may be non-contiguous, so we track them separately)
+            if (addr < effectiveBase && !hasChunks)
+                effectiveBase = addr;
+        }
 
         visited.insert(addr);
 
-        const uint8_t* p = fnData + (addr - fn.base);
-        while (p < fnEnd)
+        const uint8_t* p = addrSection->data + (addr - addrSection->base);
+        const uint8_t* sectionEnd = addrSection->data + addrSection->size;
+        
+        while (p < sectionEnd)
         {
+            uint32_t currentAddr = addrSection->base + (p - addrSection->data);
+            
+            // Always stop at other function entry points - unless it's a chunk entry
+            if (currentAddr != fn.base && functionEntryPoints.count(currentAddr) && !isInFunctionRange(currentAddr))
+                break;
+            
+            // Stop if we've gone past the effective end and hit visited code (for non-chunk code)
+            if (!isInFunctionRange(currentAddr) && currentAddr >= effectiveEnd && visited.count(currentAddr))
+                break;
+
             x86::Insn insn;
-            int len = x86::Disassemble(p, fnEnd - p, addr, insn);
+            int len = x86::Disassemble(p, sectionEnd - p, currentAddr, insn);
             if (len <= 0) break;
+
+            // Update effective end if we're past the original bounds but don't cross function boundaries
+            if (currentAddr + len > effectiveEnd && !hasChunks)
+            {
+                // Check if extending would cross into another function
+                bool wouldCrossFunction = false;
+                for (uint32_t ep : functionEntryPoints)
+                {
+                    if (ep != fn.base && ep > effectiveEnd && ep < currentAddr + len)
+                    {
+                        wouldCrossFunction = true;
+                        break;
+                    }
+                }
+                if (!wouldCrossFunction)
+                {
+                    effectiveEnd = currentAddr + len;
+                }
+            }
 
             bool isTerminator = false;
 
@@ -5202,28 +5524,84 @@ std::vector<X86BasicBlock> X86Recompiler::AnalyzeControlFlow(const Function& fn,
                 break;
 
             case x86::InsnType::Jmp:
+                isTerminator = true;
+                if (insn.is_branch_relative)
+                {
+                    // Allow jumps within function body or to function chunks
+                    bool isWithinFunction = isInFunctionRange(insn.branch_target);
+                    bool isOtherFunction = functionEntryPoints.count(insn.branch_target) && 
+                                           insn.branch_target != fn.base && 
+                                           !isWithinFunction;
+                    
+                    if (!isOtherFunction && isInSection(insn.branch_target))
+                    {
+                        blockStarts.insert(insn.branch_target);
+                        workList.push_back(insn.branch_target);
+                    }
+                }
+                break;
+
             case x86::InsnType::JmpIndirect:
                 isTerminator = true;
-                if (insn.is_branch_relative && 
-                    insn.branch_target >= fn.base && 
-                    insn.branch_target < fn.base + fn.size)
+                // Check if this is a switch table jump - add all labels as block starts
                 {
-                    blockStarts.insert(insn.branch_target);
-                    workList.push_back(insn.branch_target);
+                    auto stIt = config.switchTables.find(currentAddr);
+                    if (stIt != config.switchTables.end())
+                    {
+                        for (uint32_t label : stIt->second.labels)
+                        {
+                            bool isWithinFunction = isInFunctionRange(label);
+                            bool isOtherFunction = functionEntryPoints.count(label) && 
+                                                   label != fn.base && 
+                                                   !isWithinFunction;
+                            if (isInSection(label) && !isOtherFunction)
+                            {
+                                blockStarts.insert(label);
+                                workList.push_back(label);
+                            }
+                        }
+                        if (stIt->second.defaultLabel != 0 && isInSection(stIt->second.defaultLabel))
+                        {
+                            bool isWithinFunction = isInFunctionRange(stIt->second.defaultLabel);
+                            bool isOtherFunction = functionEntryPoints.count(stIt->second.defaultLabel) && 
+                                                   stIt->second.defaultLabel != fn.base && 
+                                                   !isWithinFunction;
+                            if (!isOtherFunction)
+                            {
+                                blockStarts.insert(stIt->second.defaultLabel);
+                                workList.push_back(stIt->second.defaultLabel);
+                            }
+                        }
+                    }
                 }
                 break;
 
             case x86::InsnType::Jcc:
                 // Conditional branch: both targets are block starts
-                if (insn.branch_target >= fn.base && insn.branch_target < fn.base + fn.size)
+                if (isInSection(insn.branch_target))
                 {
-                    blockStarts.insert(insn.branch_target);
-                    workList.push_back(insn.branch_target);
+                    // Allow jumps within function body or to function chunks
+                    bool isWithinFunction = isInFunctionRange(insn.branch_target);
+                    bool isOtherFunction = functionEntryPoints.count(insn.branch_target) && 
+                                           insn.branch_target != fn.base && 
+                                           !isWithinFunction;
+                    
+                    if (!isOtherFunction)
+                    {
+                        blockStarts.insert(insn.branch_target);
+                        workList.push_back(insn.branch_target);
+                    }
                 }
                 // Fall-through is also a block start
                 {
-                    uint32_t fallThrough = addr + len;
-                    if (fallThrough < fn.base + fn.size)
+                    uint32_t fallThrough = currentAddr + len;
+                    // Allow fall-through within function or to chunks
+                    bool isWithinFunction = isInFunctionRange(fallThrough);
+                    bool isOtherFunction = functionEntryPoints.count(fallThrough) && 
+                                           fallThrough != fn.base && 
+                                           !isWithinFunction;
+                    
+                    if (isInSection(fallThrough) && !isOtherFunction)
                     {
                         blockStarts.insert(fallThrough);
                         workList.push_back(fallThrough);
@@ -5241,18 +5619,205 @@ std::vector<X86BasicBlock> X86Recompiler::AnalyzeControlFlow(const Function& fn,
             }
 
             p += len;
-            addr += len;
 
             if (isTerminator)
                 break;
 
             // Check if we've hit another block start
-            if (blockStarts.count(addr))
+            uint32_t nextAddr = addrSection->base + (p - addrSection->data);
+            if (blockStarts.count(nextAddr))
                 break;
         }
     }
 
-    // Second pass: build basic blocks
+    // Force analysis of entire TOML-specified range to catch SEH handlers
+    // Linearly scan and add any unvisited instruction addresses
+    {
+        // Use TOML size if available, otherwise use function's detected size
+        uint32_t scanSize = fn.size;
+        if (tomlIt != config.functions.end())
+        {
+            scanSize = tomlIt->second;
+        }
+        
+        const uint8_t* p = section->data + (fn.base - section->base);
+        const uint8_t* sectionEnd = section->data + section->size;
+        const uint8_t* rangeEnd = section->data + (fn.base + scanSize - section->base);
+        
+        std::vector<uint32_t> newBlocks;
+        while (p < rangeEnd && p < sectionEnd)
+        {
+            uint32_t addr = section->base + (p - section->data);
+            
+            // Skip if this address is a known function entry point (and not our function)
+            if (addr != fn.base && functionEntryPoints.count(addr))
+            {
+                // Stop scanning - we've hit another function
+                break;
+            }
+            
+            // Try to decode instruction
+            x86::Insn insn;
+            int len = x86::Disassemble(p, sectionEnd - p, addr, insn);
+            if (len > 0)
+            {
+                if (!visited.count(addr))
+                {
+                    // Unvisited code - add to newBlocks for worklist processing
+                    blockStarts.insert(addr);
+                    newBlocks.push_back(addr);
+                }
+                p += len;
+            }
+            else
+            {
+                p++; // Skip bad byte
+            }
+        }
+        
+        if (!newBlocks.empty())
+        {
+            fmt::println("Gap scan found {} unreachable block starts in function 0x{:X}", newBlocks.size(), fn.base);
+            
+            // Process newly discovered blocks through worklist to analyze control flow
+            for (uint32_t blockAddr : newBlocks)
+            {
+                workList.push_back(blockAddr);
+            }
+            
+            // Continue worklist processing for the newly added blocks
+            while (!workList.empty())
+            {
+                uint32_t addr = workList.back();
+                workList.pop_back();
+
+                if (visited.count(addr) || !isInSection(addr))
+                    continue;
+                
+                // Don't process addresses that are other functions' entry points
+                if (addr != fn.base && functionEntryPoints.count(addr))
+                    continue;
+
+                visited.insert(addr);
+                blockStarts.insert(addr);
+
+                const uint8_t* p = section->data + (addr - section->base);
+                const uint8_t* sectionEnd = section->data + section->size;
+
+                while (p < sectionEnd)
+                {
+                    uint32_t currentAddr = section->base + (p - section->data);
+                    
+                    // Stop if we hit another function's entry point
+                    if (currentAddr != fn.base && functionEntryPoints.count(currentAddr))
+                        break;
+                    
+                    if (currentAddr > effectiveEnd)
+                        effectiveEnd = currentAddr;
+
+                    x86::Insn insn;
+                    int len = x86::Disassemble(p, sectionEnd - p, currentAddr, insn);
+                    if (len <= 0) break;
+
+                    bool isTerminator = false;
+
+                    switch (insn.type)
+                    {
+                    case x86::InsnType::Ret:
+                        isTerminator = true;
+                        break;
+
+                    case x86::InsnType::Jmp:
+                        isTerminator = true;
+                        if (insn.is_branch_relative && isInSection(insn.branch_target))
+                        {
+                            bool targetInFunction = (insn.branch_target >= fn.base && insn.branch_target < fn.base + fn.size);
+                            if (targetInFunction)
+                            {
+                                blockStarts.insert(insn.branch_target);
+                                workList.push_back(insn.branch_target);
+                            }
+                        }
+                        break;
+
+                    case x86::InsnType::Jcc:
+                        isTerminator = true;
+                        if (isInSection(insn.branch_target))
+                        {
+                            bool targetInFunction = (insn.branch_target >= fn.base && insn.branch_target < fn.base + fn.size);
+                            if (targetInFunction)
+                            {
+                                blockStarts.insert(insn.branch_target);
+                                workList.push_back(insn.branch_target);
+                            }
+                        }
+                        // Fall-through
+                        {
+                            uint32_t fallThrough = currentAddr + len;
+                            bool fallThroughInFunction = (fallThrough >= fn.base && fallThrough < fn.base + fn.size);
+                            if (isInSection(fallThrough) && fallThroughInFunction)
+                            {
+                                blockStarts.insert(fallThrough);
+                                workList.push_back(fallThrough);
+                            }
+                        }
+                        break;
+
+                    case x86::InsnType::Call:
+                        // Calls don't terminate blocks
+                        break;
+
+                    default:
+                        break;
+                    }
+
+                    p += len;
+
+                    if (isTerminator)
+                        break;
+
+                    // Check if we've hit another block start
+                    uint32_t nextAddr = section->base + (p - section->data);
+                    if (blockStarts.count(nextAddr))
+                        break;
+                }
+            }
+            
+            fmt::println("Completed worklist processing for unreachable blocks");
+            
+            // Debug: Show last few block starts to see if they cover the TOML range
+            std::vector<uint32_t> allStarts(blockStarts.begin(), blockStarts.end());
+            std::sort(allStarts.begin(), allStarts.end());
+            fmt::println("Total blockStarts: {}, last 5 addresses:", allStarts.size());
+            for (size_t i = allStarts.size() > 5 ? allStarts.size() - 5 : 0; i < allStarts.size(); i++)
+            {
+                fmt::println("  0x{:X}", allStarts[i]);
+            }
+            fmt::println("TOML-specified end: 0x{:X}, effectiveEnd: 0x{:X}", fn.base + scanSize, effectiveEnd);
+        }
+        
+        // Update effectiveEnd to cover the full TOML range, but clamp to next function entry
+        if (fn.base + scanSize > effectiveEnd)
+        {
+            uint32_t proposedEnd = fn.base + scanSize;
+            
+            // Find the earliest function entry point that's after our base and before the proposed end
+            for (uint32_t entryPoint : functionEntryPoints)
+            {
+                if (entryPoint > fn.base && entryPoint < proposedEnd)
+                {
+                    proposedEnd = entryPoint;
+                }
+            }
+            
+            if (proposedEnd > effectiveEnd)
+            {
+                effectiveEnd = proposedEnd;
+            }
+        }
+    }
+    
+    // Second pass: build basic blocks using effective bounds
     std::vector<uint32_t> sortedStarts(blockStarts.begin(), blockStarts.end());
     std::sort(sortedStarts.begin(), sortedStarts.end());
 
@@ -5261,13 +5826,36 @@ std::vector<X86BasicBlock> X86Recompiler::AnalyzeControlFlow(const Function& fn,
         X86BasicBlock block;
         block.start = sortedStarts[i];
         
-        // Block ends at next block start or function end
-        uint32_t blockEnd = fn.base + fn.size;
+        // Get section for this block (may differ for chunks)
+        const Section* blockSection = getSectionForAddress(block.start);
+        if (!blockSection)
+        {
+            fmt::println("WARNING: Block at 0x{:X} not in any section, skipping", block.start);
+            continue;
+        }
+        
+        // Block ends at next block start, chunk boundary, or section end
+        uint32_t blockEnd = blockSection->base + blockSection->size;  // Section end as default
+        
+        // Check next block start
         if (i + 1 < sortedStarts.size())
-            blockEnd = sortedStarts[i + 1];
+        {
+            uint32_t nextStart = sortedStarts[i + 1];
+            // Only use next start if it's in the same section
+            if (getSectionForAddress(nextStart) == blockSection && nextStart < blockEnd)
+            {
+                blockEnd = nextStart;
+            }
+        }
+        
+        // For non-chunk blocks, also consider effectiveEnd
+        if (!hasChunks && effectiveEnd < blockEnd)
+        {
+            blockEnd = effectiveEnd;
+        }
 
-        const uint8_t* p = fnData + (block.start - fn.base);
-        const uint8_t* pEnd = fnData + (blockEnd - fn.base);
+        const uint8_t* p = blockSection->data + (block.start - blockSection->base);
+        const uint8_t* pEnd = blockSection->data + (blockEnd - blockSection->base);
         uint32_t addr = block.start;
 
         // Find the actual terminator
@@ -5304,8 +5892,12 @@ std::vector<X86BasicBlock> X86Recompiler::AnalyzeControlFlow(const Function& fn,
             case x86::InsnType::Jcc:
                 block.end = nextAddr;
                 block.fallsThrough = true;  // Falls through if condition is false
-                if (insn.branch_target >= fn.base && insn.branch_target < fn.base + fn.size)
+                // Allow targets within function body or chunks
+                if (isInFunctionRange(insn.branch_target) || 
+                    (insn.branch_target >= effectiveBase && insn.branch_target < effectiveEnd))
+                {
                     block.condTargets.push_back(insn.branch_target);
+                }
                 break;
 
             case x86::InsnType::Int3:
@@ -5331,17 +5923,19 @@ std::vector<X86BasicBlock> X86Recompiler::AnalyzeControlFlow(const Function& fn,
         if (block.end == 0)
         {
             block.end = blockEnd;
-            block.fallsThrough = (blockEnd < fn.base + fn.size);
+            // Only falls through if there's a next block starting at blockEnd
+            block.fallsThrough = blockStarts.count(blockEnd) > 0;
         }
 
         blocks.push_back(block);
     }
 
-    return blocks;
+    return ControlFlowResult{std::move(blocks), effectiveBase, effectiveEnd, hasChunks, functionRanges};
 }
 
 std::set<uint32_t> X86Recompiler::CollectLabelAddresses(const Function& fn, const Section* section,
-                                                         const std::vector<X86BasicBlock>& blocks)
+                                                         const std::vector<X86BasicBlock>& blocks,
+                                                         uint32_t effectiveBase, uint32_t effectiveEnd)
 {
     std::set<uint32_t> labels;
 
@@ -5351,15 +5945,15 @@ std::set<uint32_t> X86Recompiler::CollectLabelAddresses(const Function& fn, cons
         labels.insert(blocks[i].start);
     }
 
-    // All conditional and unconditional jump targets within function need labels
+    // All conditional and unconditional jump targets within effective function range need labels
     for (const auto& block : blocks)
     {
-        if (block.jumpTarget >= fn.base && block.jumpTarget < fn.base + fn.size)
+        if (block.jumpTarget >= effectiveBase && block.jumpTarget < effectiveEnd)
             labels.insert(block.jumpTarget);
 
         for (uint32_t target : block.condTargets)
         {
-            if (target >= fn.base && target < fn.base + fn.size)
+            if (target >= effectiveBase && target < effectiveEnd)
                 labels.insert(target);
         }
     }
@@ -5394,12 +5988,48 @@ bool X86Recompiler::Recompile(const Function& fn)
         return false;
     }
 
-    const uint8_t* fnData = fnSection->data + (fn.base - fnSection->base);
-    const uint8_t* fnEnd = fnData + fn.size;
-
-    // Analyze control flow
-    auto blocks = AnalyzeControlFlow(fn, fnSection);
-    auto labels = CollectLabelAddresses(fn, fnSection, blocks);
+    // Analyze control flow - this may extend bounds beyond fn.base/fn.size
+    auto cfResult = AnalyzeControlFlow(fn, fnSection);
+    auto& blocks = cfResult.blocks;
+    uint32_t effectiveBase = cfResult.effectiveBase;
+    uint32_t effectiveEnd = cfResult.effectiveEnd;
+    bool hasChunks = cfResult.hasChunks;
+    auto& functionRanges = cfResult.functionRanges;
+    
+    // Helper to get section for address (needed for chunks in different sections)
+    auto getSectionForAddress = [&](uint32_t addr) -> const Section* {
+        for (const auto& sec : image.sections)
+        {
+            if (addr >= sec.base && addr < sec.base + sec.size)
+                return &sec;
+        }
+        return nullptr;
+    };
+    
+    // Helper to check if address is in function range (including chunks)
+    auto isInFunctionRange = [&](uint32_t addr) -> bool {
+        for (const auto& [start, end] : functionRanges)
+        {
+            if (addr >= start && addr < end)
+                return true;
+        }
+        return false;
+    };
+    
+    auto labels = CollectLabelAddresses(fn, fnSection, blocks, effectiveBase, effectiveEnd);
+    
+    // Add chunk entry points as labels if function has chunks
+    if (hasChunks)
+    {
+        auto chunksIt = config.functionChunks.find(fn.base);
+        if (chunksIt != config.functionChunks.end())
+        {
+            for (const auto& [chunkAddr, chunkSize] : chunksIt->second)
+            {
+                labels.insert(chunkAddr);
+            }
+        }
+    }
 
     // Generate function header
     std::string tempOut;
@@ -5414,10 +6044,21 @@ bool X86Recompiler::Recompile(const Function& fn)
     for (size_t blockIdx = 0; blockIdx < blocks.size(); blockIdx++)
     {
         const auto& block = blocks[blockIdx];
-        const uint8_t* p = fnData + (block.start - fn.base);
+        
+        // Get section for this block (may be different for chunks)
+        const Section* blockSection = getSectionForAddress(block.start);
+        if (!blockSection)
+        {
+            println("\t// ERROR: Block at {:X} not in any section", block.start);
+            allRecompiled = false;
+            continue;
+        }
+        
+        const uint8_t* p = blockSection->data + (block.start - blockSection->base);
+        const uint8_t* blockEnd = blockSection->data + (block.end - blockSection->base);
         uint32_t addr = block.start;
 
-        while (addr < block.end && p < fnEnd)
+        while (addr < block.end && p < blockEnd)
         {
             // Check for switch table at this address
             auto st = config.switchTables.find(addr);
@@ -5441,7 +6082,7 @@ bool X86Recompiler::Recompile(const Function& fn)
             }
 
             x86::Insn insn;
-            int len = x86::Disassemble(p, fnEnd - p, addr, insn);
+            int len = x86::Disassemble(p, blockEnd - p, addr, insn);
             if (len <= 0)
             {
                 println("\t// ERROR: Failed to disassemble at {:X}", addr);
@@ -5455,7 +6096,7 @@ bool X86Recompiler::Recompile(const Function& fn)
             uint32_t nextAddr = addr + len;
             bool needsFallThroughLabel = labels.count(nextAddr) > 0;
 
-            if (!RecompileInstruction(fn, addr, insn, p, switchTable, localVariables, needsFallThroughLabel))
+            if (!RecompileInstruction(fn, addr, insn, p, switchTable, localVariables, needsFallThroughLabel, effectiveBase, effectiveEnd))
             {
                 allRecompiled = false;
             }
@@ -5497,7 +6138,7 @@ bool X86Recompiler::Recompile(const Function& fn)
     // Generate function declaration with local variables
     std::swap(out, tempOut);
 
-    println("// {:X} - {:X} ({} basic blocks)", fn.base, fn.base + fn.size, blocks.size());
+    println("// {:X} - {:X} ({} basic blocks)", effectiveBase, effectiveEnd, blocks.size());
     println("X86_FUNC_IMPL({}) {{", fnSymbol->name);
     println("\tX86_FUNC_PROLOGUE();");
 
@@ -5600,22 +6241,94 @@ void X86Recompiler::Recompile(const std::filesystem::path& headerFilePath)
     }
 
     // Generate recompiled functions
+    size_t functionsRecompiled = 0;
+    
+    // In single function mode, check if the function exists in our list
+    // If not, try to add it from the manual functions in config
+    if (config.singleFunctionAddress != 0)
+    {
+        bool found = false;
+        for (const auto& fn : functions)
+        {
+            if (fn.base == config.singleFunctionAddress)
+            {
+                found = true;
+                break;
+            }
+        }
+        
+        if (!found)
+        {
+            fmt::println("DEBUG: Function 0x{:X} not found in analyzed functions list (total: {})", 
+                        config.singleFunctionAddress, functions.size());
+            fmt::println("DEBUG: config.functions map has {} entries", config.functions.size());
+            
+            // Check if it's in the TOML functions
+            auto it = config.functions.find(config.singleFunctionAddress);
+            if (it != config.functions.end())
+            {
+                fmt::println("Function 0x{:X} not in analyzed functions list, but found in TOML with size 0x{:X} - adding it", 
+                            config.singleFunctionAddress, it->second);
+                
+                // Check if symbol exists, create it if it doesn't
+                auto symIt = image.symbols.find(config.singleFunctionAddress);
+                if (symIt == image.symbols.end())
+                {
+                    fmt::println("Creating symbol for function 0x{:X}", config.singleFunctionAddress);
+                    Symbol sym;
+                    sym.name = fmt::format("sub_{:X}", config.singleFunctionAddress);
+                    sym.address = config.singleFunctionAddress;
+                    sym.size = it->second;
+                    sym.type = Symbol_Function;
+                    image.symbols.insert(sym);
+                }
+                
+                Function fn;
+                fn.base = config.singleFunctionAddress;
+                fn.size = it->second;
+                functions.push_back(fn);
+                found = true;
+            }
+            else
+            {
+                fmt::println("ERROR: Function 0x{:X} NOT found in config.functions map", config.singleFunctionAddress);
+            }
+        }
+    }
+    
     for (size_t i = 0; i < functions.size(); i++)
     {
-        if ((i % 256) == 0)
+        // If single function mode, skip all others
+        if (config.singleFunctionAddress != 0 && functions[i].base != config.singleFunctionAddress)
+            continue;
+
+        if ((functionsRecompiled % 256) == 0)
         {
             SaveCurrentOutData();
             println("#include \"x86_recomp_shared.h\"");
             println("");
         }
 
-        if ((i % 2048) == 0 || (i == functions.size() - 1))
+        if (config.singleFunctionAddress == 0 && ((i % 2048) == 0 || (i == functions.size() - 1)))
         {
             fmt::println("Recompiling functions... {:.1f}%", 
                         static_cast<float>(i + 1) / functions.size() * 100.0f);
         }
 
         Recompile(functions[i]);
+        functionsRecompiled++;
+
+        // If single function mode and we found it, we're done
+        if (config.singleFunctionAddress != 0)
+        {
+            fmt::println("Successfully recompiled function at 0x{:X}", config.singleFunctionAddress);
+            break;
+        }
+    }
+
+    if (config.singleFunctionAddress != 0 && functionsRecompiled == 0)
+    {
+        fmt::println("ERROR: Function at address 0x{:X} not found anywhere", config.singleFunctionAddress);
     }
 
     SaveCurrentOutData();

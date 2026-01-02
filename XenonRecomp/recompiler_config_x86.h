@@ -75,6 +75,13 @@ struct X86RecompilerConfig
     // Manual function definitions
     std::unordered_map<uint32_t, uint32_t> functions;  // address -> size
 
+    // Function chunks - discontinuous code belonging to a function
+    // Maps parent function address -> vector of {chunk_address, chunk_size}
+    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> functionChunks;
+
+    // Single function recompilation (0 = recompile all)
+    uint32_t singleFunctionAddress = 0;
+
     // Invalid instruction patterns to skip (padding, exception data)
     std::unordered_map<uint32_t, uint32_t> invalidInstructions;  // data pattern -> size
     std::unordered_map<uint32_t, uint32_t> invalidAddresses;     // specific address -> size

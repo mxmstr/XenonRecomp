@@ -37,6 +37,7 @@ struct X86Recompiler
 {
     Image image;
     std::vector<Function> functions;
+    std::set<uint32_t> functionEntryPoints;  // All function entry addresses for tail call detection
     std::string out;
     size_t cppFileIndex = 0;
     X86RecompilerConfig config;
@@ -63,6 +64,15 @@ struct X86Recompiler
 
     void Analyse();
 
+    // Result of control flow analysis
+    struct ControlFlowResult {
+        std::vector<X86BasicBlock> blocks;
+        uint32_t effectiveBase;  // May be earlier than fn.base due to backward jumps
+        uint32_t effectiveEnd;   // May be later than fn.base + fn.size
+        bool hasChunks;          // True if function has discontinuous chunks
+        std::set<std::pair<uint32_t, uint32_t>> functionRanges;  // All {start, end} ranges including chunks
+    };
+
     // Recompile a single instruction
     bool RecompileInstruction(
         const Function& fn,
@@ -71,14 +81,17 @@ struct X86Recompiler
         const uint8_t* data,
         std::unordered_map<uint32_t, X86RecompilerSwitchTable>::iterator& switchTable,
         X86RecompilerLocalVariables& localVariables,
-        bool needsFallThroughLabel);
+        bool needsFallThroughLabel,
+        uint32_t effectiveBase,
+        uint32_t effectiveEnd);
 
     // Analyze control flow and build basic blocks
-    std::vector<X86BasicBlock> AnalyzeControlFlow(const Function& fn, const Section* section);
+    ControlFlowResult AnalyzeControlFlow(const Function& fn, const Section* section);
     
     // Collect all addresses that need labels
     std::set<uint32_t> CollectLabelAddresses(const Function& fn, const Section* section,
-                                              const std::vector<X86BasicBlock>& blocks);
+                                              const std::vector<X86BasicBlock>& blocks,
+                                              uint32_t effectiveBase, uint32_t effectiveEnd);
 
     // Recompile an entire function
     bool Recompile(const Function& fn);

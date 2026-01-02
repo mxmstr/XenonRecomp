@@ -264,6 +264,19 @@ int main(int argc, char** argv)
         std::string switchTableFileName = baseName + "_switch_tables.toml";
         std::filesystem::path switchTablePath = outputDir / switchTableFileName;
         
+        // Determine code address range for vtable scanning
+        uint32_t codeStart = UINT32_MAX;
+        uint32_t codeEnd = 0;
+        for (const auto& section : image.sections)
+        {
+            if (section.flags & SectionFlags_Code)
+            {
+                codeStart = (std::min)(codeStart, static_cast<uint32_t>(section.base));
+                codeEnd = (std::max)(codeEnd, static_cast<uint32_t>(section.base + section.size));
+            }
+        }
+        fmt::println("Code range: 0x{:X} - 0x{:X}", codeStart, codeEnd);
+        
         // Find functions in code sections
         fmt::println("Scanning for functions...");
         std::vector<uint32_t> allFunctions;
@@ -276,6 +289,55 @@ int main(int argc, char** argv)
             auto funcs = FindX86Functions(section.data, section.size, section.base);
             fmt::println("  {} : {} functions found", section.name, funcs.size());
             allFunctions.insert(allFunctions.end(), funcs.begin(), funcs.end());
+        }
+        
+        fmt::println("Total functions from calls: {}", allFunctions.size());
+        
+        // Scan vtables in data sections for additional functions
+        fmt::println("Scanning vtables in data sections...");
+        std::set<uint32_t> vtableFunctions;
+        
+        for (const auto& section : image.sections)
+        {
+            // Scan both data sections and read-only data sections
+            // .rdata typically contains vtables
+            // Also scan code sections as some compilers embed vtables there
+            bool isData = !(section.flags & SectionFlags_Code);
+            bool isRdata = (section.name == ".rdata" || section.name.find("rdata") != std::string::npos);
+            bool isCode = (section.flags & SectionFlags_Code);
+            
+            // Skip sections that are clearly not going to have vtables
+            if (!isData && !isRdata && !isCode)
+                continue;
+            
+            auto funcs = FindX86VtableFunctions(
+                section.data, section.size, section.base,
+                codeStart, codeEnd
+            );
+            
+            if (!funcs.empty())
+            {
+                fmt::println("  {} : {} vtable entries found", section.name, funcs.size());
+                vtableFunctions.insert(funcs.begin(), funcs.end());
+            }
+        }
+        
+        // Add vtable functions that aren't already in our list
+        size_t vtableNew = 0;
+        std::set<uint32_t> existingFunctions(allFunctions.begin(), allFunctions.end());
+        for (uint32_t fn : vtableFunctions)
+        {
+            if (!existingFunctions.count(fn))
+            {
+                allFunctions.push_back(fn);
+                vtableNew++;
+            }
+        }
+        
+        if (vtableNew > 0)
+        {
+            fmt::println("Added {} new functions from vtables", vtableNew);
+            std::sort(allFunctions.begin(), allFunctions.end());
         }
         
         fmt::println("Total functions found: {}", allFunctions.size());
@@ -485,36 +547,133 @@ int main(int argc, char** argv)
                          originalCount - allFunctions.size());
         }
         
+        // Filter out functions that start with Int3 padding (0xCC) or invalid bytes
+        // These are false positives from call target scanning through data
+        originalCount = allFunctions.size();
+        allFunctions.erase(
+            std::remove_if(allFunctions.begin(), allFunctions.end(),
+                [&image](uint32_t addr) {
+                    // Find section containing this address
+                    for (const auto& section : image.sections)
+                    {
+                        if (addr >= section.base && addr < section.base + section.size)
+                        {
+                            const uint8_t* funcData = section.data + (addr - section.base);
+                            
+                            // Skip if starts with Int3 (0xCC) - padding, not a function
+                            if (*funcData == 0xCC)
+                                return true;
+                                
+                            // Skip if starts with null byte (0x00) - padding
+                            if (*funcData == 0x00)
+                                return true;
+                                
+                            return false;
+                        }
+                    }
+                    return true; // Not in any section - remove
+                }),
+            allFunctions.end()
+        );
+        
+        if (allFunctions.size() < originalCount)
+        {
+            fmt::println("Filtered out {} false functions starting with padding bytes", 
+                         originalCount - allFunctions.size());
+        }
+        
         // Output functions array
         println("# ---- FUNCTIONS ({} total) ----", allFunctions.size());
         println("# Functions with incorrect boundaries should be manually adjusted.");
         println("functions = [");
         
-        // Calculate function sizes and output
+        // First pass: analyze all functions to get their actual sizes
+        // Don't limit by next candidate function - that candidate might be a false positive!
+        struct AnalyzedFunc {
+            uint32_t addr;
+            uint32_t size;
+        };
+        std::vector<AnalyzedFunc> analyzedFuncs;
+        analyzedFuncs.reserve(allFunctions.size());
+        
         for (size_t i = 0; i < allFunctions.size(); i++)
         {
             uint32_t addr = allFunctions[i];
-            uint32_t size;
+            uint32_t size = 1;
             
-            if (i + 1 < allFunctions.size())
+            // Find the section containing this function
+            const Section* funcSection = nullptr;
+            for (const auto& section : image.sections)
             {
-                size = allFunctions[i + 1] - addr;
-            }
-            else
-            {
-                // Last function - estimate based on section end
-                size = 0x100; // default estimate
-                for (const auto& section : image.sections)
+                if (addr >= section.base && addr < section.base + section.size)
                 {
-                    if (addr >= section.base && addr < section.base + section.size)
-                    {
-                        size = (section.base + section.size) - addr;
-                        break;
-                    }
+                    funcSection = &section;
+                    break;
                 }
             }
             
-            println("    {{ address = 0x{:X}, size = 0x{:X} }},", addr, size);
+            if (funcSection)
+            {
+                // Max size is section end - don't limit by next candidate function
+                // because that candidate might be a false positive within this function
+                uint32_t maxSize = (funcSection->base + funcSection->size) - addr;
+                
+                // Get pointer to function code
+                const uint8_t* funcCode = funcSection->data + (addr - funcSection->base);
+                
+                // Analyze the function to get its actual size
+                Function fn = AnalyzeX86Function(funcCode, maxSize, addr);
+                size = fn.size;
+                
+                // Ensure minimum size of 1 byte
+                if (size == 0)
+                    size = 1;
+            }
+            
+            analyzedFuncs.push_back({addr, size});
+        }
+        
+        // Second pass: filter out functions that fall within another function's range
+        // (i.e., mid-function addresses that were falsely detected as call targets)
+        std::vector<AnalyzedFunc> filteredFuncs;
+        filteredFuncs.reserve(analyzedFuncs.size());
+        
+        for (size_t i = 0; i < analyzedFuncs.size(); i++)
+        {
+            const auto& func = analyzedFuncs[i];
+            bool isOverlapped = false;
+            
+            // Check if this function starts within a previous function's range
+            for (size_t j = 0; j < i; j++)
+            {
+                const auto& prevFunc = analyzedFuncs[j];
+                uint32_t prevEnd = prevFunc.addr + prevFunc.size;
+                
+                // If this function starts within the previous function's range,
+                // it's likely a false positive (mid-function address)
+                if (func.addr > prevFunc.addr && func.addr < prevEnd)
+                {
+                    isOverlapped = true;
+                    break;
+                }
+            }
+            
+            if (!isOverlapped)
+            {
+                filteredFuncs.push_back(func);
+            }
+        }
+        
+        if (filteredFuncs.size() < analyzedFuncs.size())
+        {
+            fmt::println("Filtered out {} overlapping mid-function addresses", 
+                         analyzedFuncs.size() - filteredFuncs.size());
+        }
+        
+        // Output filtered functions
+        for (const auto& func : filteredFuncs)
+        {
+            println("    {{ address = 0x{:X}, size = 0x{:X} }},", func.addr, func.size);
         }
         
         println("]");

@@ -43,3 +43,9 @@ std::vector<X86SwitchTable> FindX86JumpTables(const void* code, size_t size, uin
 
 // Read jump table entries from memory
 void ReadX86JumpTable(X86SwitchTable& table, const uint8_t* imageBase, uint32_t imageStart);
+
+// Scan data sections for vtables (arrays of function pointers)
+// Returns vector of function addresses found in vtables
+// codeStart/codeEnd define the valid range for code pointers
+std::vector<uint32_t> FindX86VtableFunctions(const void* data, size_t size, uint32_t base,
+                                              uint32_t codeStart, uint32_t codeEnd);

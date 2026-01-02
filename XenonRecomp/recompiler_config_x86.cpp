@@ -13,6 +13,22 @@ void X86RecompilerConfig::Load(const std::string_view& configFilePath)
     if (auto mainPtr = toml["main"].as_table())
     {
         const auto& main = *mainPtr;
+        fmt::println("DEBUG: Found [main] section");
+        
+        // Check if functions key exists
+        auto functionsNode = main["functions"];
+        if (functionsNode)
+        {
+            fmt::println("DEBUG: 'functions' key exists, type: {}", 
+                functionsNode.is_array() ? "array" : 
+                functionsNode.is_table() ? "table" : 
+                functionsNode.is_value() ? "value" : "unknown");
+        }
+        else
+        {
+            fmt::println("DEBUG: 'functions' key does NOT exist in [main]");
+        }
+        
         filePath = main["file_path"].value_or<std::string>("");
         outDirectoryPath = main["out_directory_path"].value_or<std::string>("");
         switchTableFilePath = main["switch_table_file_path"].value_or<std::string>("");
@@ -34,16 +50,46 @@ void X86RecompilerConfig::Load(const std::string_view& configFilePath)
         sehPrologAddress = main["seh_prolog_address"].value_or(0u);
         sehEpilogAddress = main["seh_epilog_address"].value_or(0u);
 
-        // Manual function definitions
-        if (auto functionsArray = main["functions"].as_array())
+        // Manual function definitions - check both [main] and top-level
+        auto functionsArray = main["functions"].as_array();
+        if (!functionsArray)
         {
+            functionsArray = toml["functions"].as_array();
+        }
+        
+        if (functionsArray)
+        {
+            fmt::println("Found functions array in TOML with {} entries", functionsArray->size());
             for (auto& func : *functionsArray)
             {
                 auto& funcTable = *func.as_table();
                 uint32_t address = *funcTable["address"].value<uint32_t>();
                 uint32_t size = *funcTable["size"].value<uint32_t>();
                 functions.emplace(address, size);
+                
+                // Parse function chunks if present
+                if (auto chunksArray = funcTable["chunks"].as_array())
+                {
+                    std::vector<std::pair<uint32_t, uint32_t>> chunks;
+                    for (auto& chunk : *chunksArray)
+                    {
+                        auto& chunkTable = *chunk.as_table();
+                        uint32_t chunkAddr = *chunkTable["address"].value<uint32_t>();
+                        uint32_t chunkSize = *chunkTable["size"].value<uint32_t>();
+                        chunks.emplace_back(chunkAddr, chunkSize);
+                    }
+                    if (!chunks.empty())
+                    {
+                        functionChunks.emplace(address, std::move(chunks));
+                        fmt::println("  Function 0x{:X} has {} chunks", address, functionChunks[address].size());
+                    }
+                }
             }
+            fmt::println("Loaded {} functions into config.functions map", functions.size());
+        }
+        else
+        {
+            fmt::println("WARNING: No functions array found in [main] or top-level");
         }
 
         // Invalid instruction patterns
