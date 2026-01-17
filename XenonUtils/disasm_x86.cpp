@@ -12,6 +12,20 @@ const char* GetRegName(Reg reg)
     return "???";
 }
 
+// Convert register value to 8-bit register for operandSize == 1
+// For reg 0-3: AL, CL, DL, BL (low byte of EAX, ECX, EDX, EBX)
+// For reg 4-7: AH, CH, DH, BH (high byte of EAX, ECX, EDX, EBX)
+static Reg ConvertTo8BitReg(Reg reg)
+{
+    uint8_t regVal = static_cast<uint8_t>(reg);
+    if (regVal >= 4 && regVal <= 7)
+    {
+        // ESP->AH, EBP->CH, ESI->DH, EDI->BH
+        return static_cast<Reg>(AH + (regVal - 4));
+    }
+    return reg;  // AL, CL, DL, BL use the same encoding as EAX, ECX, EDX, EBX
+}
+
 // Helper to read unaligned little-endian values safely
 template<typename T>
 static T ReadUnaligned(const uint8_t* p)
@@ -676,7 +690,7 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         out.op[1].imm = *p++;
         
         uint8_t op = (opcode >> 3) & 7;
-        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Add, InsnType::Sub, 
+        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Adc, InsnType::Sbb, 
                                             InsnType::And, InsnType::Sub, InsnType::Xor, InsnType::Cmp };
         out.type = opTypes[op];
         
@@ -707,7 +721,7 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         }
         
         uint8_t op = (opcode >> 3) & 7;
-        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Add, InsnType::Sub, 
+        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Adc, InsnType::Sbb, 
                                             InsnType::And, InsnType::Sub, InsnType::Xor, InsnType::Cmp };
         out.type = opTypes[op];
         
@@ -807,13 +821,16 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg regField;
         int extra = ParseModRM(p, end - p, out.op[0], regField);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (out.op[0].type == OpType::Reg)
+            out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
         out.op[1].type = OpType::Reg;
-        out.op[1].reg = regField;
+        out.op[1].reg = ConvertTo8BitReg(regField);
         p += 1 + extra;
         
         // Determine operation type from opcode
         uint8_t op = (opcode >> 3) & 7;
-        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Add, InsnType::Sub, 
+        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Adc, InsnType::Sbb, 
                                             InsnType::And, InsnType::Sub, InsnType::Xor, InsnType::Cmp };
         out.type = opTypes[op];
         
@@ -833,7 +850,7 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         p += 1 + extra;
         
         uint8_t op = (opcode >> 3) & 7;
-        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Add, InsnType::Sub, 
+        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Adc, InsnType::Sbb, 
                                             InsnType::And, InsnType::Sub, InsnType::Xor, InsnType::Cmp };
         out.type = opTypes[op];
         
@@ -849,12 +866,15 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg regField;
         int extra = ParseModRM(p, end - p, out.op[1], regField);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (out.op[1].type == OpType::Reg)
+            out.op[1].reg = ConvertTo8BitReg(out.op[1].reg);
         out.op[0].type = OpType::Reg;
-        out.op[0].reg = regField;
+        out.op[0].reg = ConvertTo8BitReg(regField);
         p += 1 + extra;
         
         uint8_t op = (opcode >> 3) & 7;
-        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Add, InsnType::Sub, 
+        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Adc, InsnType::Sbb, 
                                             InsnType::And, InsnType::Sub, InsnType::Xor, InsnType::Cmp };
         out.type = opTypes[op];
         
@@ -874,7 +894,7 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         p += 1 + extra;
         
         uint8_t op = (opcode >> 3) & 7;
-        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Add, InsnType::Sub, 
+        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Adc, InsnType::Sbb, 
                                             InsnType::And, InsnType::Sub, InsnType::Xor, InsnType::Cmp };
         out.type = opTypes[op];
         
@@ -923,7 +943,7 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
     case 0x7C: case 0x7D: case 0x7E: case 0x7F:
         if (end - p < 1) return 0;
         out.type = InsnType::Jcc;
-        out.cond = static_cast<Condition>(opcode - 0x70);
+        out.cond = static_cast<Condition>(opcode - 0x70 + 1);
         out.is_branch_relative = true;
         out.branch_target = address + 2 + static_cast<int8_t>(*p);
         p++;
@@ -943,7 +963,7 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         p += 1 + extra;
         
         // Operation determined by reg field: 0=ADD, 1=OR, 2=ADC, 3=SBB, 4=AND, 5=SUB, 6=XOR, 7=CMP
-        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Add, InsnType::Sub,
+        static const InsnType opTypes[] = { InsnType::Add, InsnType::Or, InsnType::Adc, InsnType::Sbb,
                                             InsnType::And, InsnType::Sub, InsnType::Xor, InsnType::Cmp };
         out.type = opTypes[opExt & 7];
         
@@ -951,6 +971,9 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         if (opcode == 0x80 || opcode == 0x82)
         {
             out.operandSize = 1;
+            // Convert high-byte registers for 8-bit operands
+            if (out.op[0].type == OpType::Reg)
+                out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
             if (end - p < 1) return 0;
             out.op[1].imm = *p++;
         }
@@ -989,8 +1012,11 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg regField;
         int extra = ParseModRM(p, end - p, out.op[0], regField);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (out.op[0].type == OpType::Reg)
+            out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
         out.op[1].type = OpType::Reg;
-        out.op[1].reg = regField;
+        out.op[1].reg = ConvertTo8BitReg(regField);
         p += 1 + extra;
         out.length = static_cast<uint8_t>(p - start);
         return out.length;
@@ -1020,8 +1046,11 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg regField;
         int extra = ParseModRM(p, end - p, out.op[0], regField);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (out.op[0].type == OpType::Reg)
+            out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
         out.op[1].type = OpType::Reg;
-        out.op[1].reg = regField;
+        out.op[1].reg = ConvertTo8BitReg(regField);
         p += 1 + extra;
         out.length = static_cast<uint8_t>(p - start);
         return out.length;
@@ -1051,8 +1080,11 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg regField;
         int extra = ParseModRM(p, end - p, out.op[0], regField);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (out.op[0].type == OpType::Reg)
+            out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
         out.op[1].type = OpType::Reg;
-        out.op[1].reg = regField;
+        out.op[1].reg = ConvertTo8BitReg(regField);
         p += 1 + extra;
         out.length = static_cast<uint8_t>(p - start);
         return out.length;
@@ -1082,8 +1114,11 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg regField;
         int extra = ParseModRM(p, end - p, out.op[1], regField);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (out.op[1].type == OpType::Reg)
+            out.op[1].reg = ConvertTo8BitReg(out.op[1].reg);
         out.op[0].type = OpType::Reg;
-        out.op[0].reg = regField;
+        out.op[0].reg = ConvertTo8BitReg(regField);
         p += 1 + extra;
         out.length = static_cast<uint8_t>(p - start);
         return out.length;
@@ -1287,6 +1322,9 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg opExt;
         int extra = ParseModRM(p, end - p, out.op[0], opExt);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (opcode == 0xC0 && out.op[0].type == OpType::Reg)
+            out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
         p += 1 + extra;
         
         if (end - p < 1) return 0;
@@ -1328,6 +1366,9 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg opExt;
         int extra = ParseModRM(p, end - p, out.op[0], opExt);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (opcode == 0xC6 && out.op[0].type == OpType::Reg)
+            out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
         p += 1 + extra;
         
         // Only MOV is valid (opExt should be 0)
@@ -1389,6 +1430,9 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg opExt;
         int extra = ParseModRM(p, end - p, out.op[0], opExt);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if ((opcode == 0xD0 || opcode == 0xD2) && out.op[0].type == OpType::Reg)
+            out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
         p += 1 + extra;
         
         out.op[1].type = OpType::Imm;
@@ -1716,6 +1760,9 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg opExt;
         int extra = ParseModRM(p, end - p, out.op[0], opExt);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (out.op[0].type == OpType::Reg)
+            out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
         p += 1 + extra;
         
         // 0=INC, 1=DEC, others undefined
@@ -1736,6 +1783,9 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         Reg opExt;
         int extra = ParseModRM(p, end - p, out.op[0], opExt);
         if (extra < 0) return 0;
+        // Convert high-byte registers for 8-bit operands
+        if (opcode == 0xF6 && out.op[0].type == OpType::Reg)
+            out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
         p += 1 + extra;
         
         // 0=TEST imm, 1=(undefined), 2=NOT, 3=NEG, 4=MUL, 5=IMUL, 6=DIV, 7=IDIV
@@ -2107,7 +2157,7 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         {
             if (end - p < 4) return 0;
             out.type = InsnType::Jcc;
-            out.cond = static_cast<Condition>(op2 - 0x80);
+            out.cond = static_cast<Condition>(op2 - 0x80 + 1);
             out.is_branch_relative = true;
             out.branch_target = address + 6 + ReadUnaligned<int32_t>(p);
             p += 4;
@@ -2120,11 +2170,14 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         {
             if (end - p < 1) return 0;
             out.type = InsnType::SetCC;
-            out.cond = static_cast<Condition>(op2 - 0x90);
+            out.cond = static_cast<Condition>(op2 - 0x90 + 1);
             out.operandSize = 1;
             Reg regField;
             int extra = ParseModRM(p, end - p, out.op[0], regField);
             if (extra < 0) return 0;
+            // Convert high-byte registers for 8-bit operands
+            if (out.op[0].type == OpType::Reg)
+                out.op[0].reg = ConvertTo8BitReg(out.op[0].reg);
             p += 1 + extra;
             out.length = static_cast<uint8_t>(p - start);
             return out.length;
@@ -2135,7 +2188,7 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
         {
             if (end - p < 1) return 0;
             out.type = InsnType::Cmovcc;
-            out.cond = static_cast<Condition>(op2 - 0x40);
+            out.cond = static_cast<Condition>(op2 - 0x40 + 1);
             Reg regField;
             int extra = ParseModRM(p, end - p, out.op[1], regField);
             if (extra < 0) return 0;
@@ -2155,6 +2208,9 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
             Reg regField;
             int extra = ParseModRM(p, end - p, out.op[1], regField);
             if (extra < 0) return 0;
+            // Convert high-byte registers for 8-bit source operand
+            if (out.op[1].type == OpType::Reg)
+                out.op[1].reg = ConvertTo8BitReg(out.op[1].reg);
             out.op[0].type = OpType::Reg;
             out.op[0].reg = regField;
             p += 1 + extra;
@@ -2187,6 +2243,9 @@ int Disassemble(const void* code, size_t maxLen, uint32_t address, Insn& out)
             Reg regField;
             int extra = ParseModRM(p, end - p, out.op[1], regField);
             if (extra < 0) return 0;
+            // Convert high-byte registers for 8-bit source operand
+            if (out.op[1].type == OpType::Reg)
+                out.op[1].reg = ConvertTo8BitReg(out.op[1].reg);
             out.op[0].type = OpType::Reg;
             out.op[0].reg = regField;
             p += 1 + extra;

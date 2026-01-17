@@ -19,6 +19,8 @@ namespace x86
         Lea,            // lea - load effective address
         Sub,            // sub esp, imm
         Add,            // add esp, imm
+        Adc,            // adc - add with carry
+        Sbb,            // sbb - subtract with borrow
         Ret,            // ret / retn
         Leave,          // leave
         Enter,          // enter
@@ -369,6 +371,9 @@ namespace x86
         MM0 = 8, MM1, MM2, MM3, MM4, MM5, MM6, MM7,
         // XMM registers (16-23)
         XMM0 = 16, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
+        // High-byte registers (24-27) - AH, CH, DH, BH
+        // These are used when operandSize == 1 and the register field is 4-7
+        AH = 24, CH, DH, BH,
         X86_REG_NONE = 0xFF
     };
 

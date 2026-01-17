@@ -92,7 +92,7 @@ void X86RecompilerConfig::Load(const std::string_view& configFilePath)
             fmt::println("WARNING: No functions array found in [main] or top-level");
         }
 
-        // Invalid instruction patterns
+        // Invalid instruction patterns (check inside [main] first)
         if (auto invalidArray = main["invalid_instructions"].as_array())
         {
             for (auto& instr : *invalidArray)
@@ -235,5 +235,26 @@ void X86RecompilerConfig::Load(const std::string_view& configFilePath)
 
             midAsmHooks.emplace(*table["address"].value<uint32_t>(), std::move(midAsmHook));
         }
+    }
+    
+    // Also check for top-level [[invalid_instructions]] (outside [main])
+    if (auto invalidArray = toml["invalid_instructions"].as_array())
+    {
+        for (auto& instr : *invalidArray)
+        {
+            auto& instrTable = *instr.as_table();
+            uint32_t size = *instrTable["size"].value<uint32_t>();
+            
+            // Check if it's an address-based entry or data-pattern entry
+            if (auto addrVal = instrTable["address"].value<uint32_t>())
+            {
+                invalidAddresses.emplace(*addrVal, size);
+            }
+            else if (auto dataVal = instrTable["data"].value<uint32_t>())
+            {
+                invalidInstructions.emplace(*dataVal, size);
+            }
+        }
+        fmt::println("Loaded {} invalid addresses from top-level TOML", invalidAddresses.size());
     }
 }

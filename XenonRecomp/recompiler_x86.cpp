@@ -36,7 +36,8 @@ const char* X86Recompiler::GetXmmRegName(x86::Reg reg)
 const char* X86Recompiler::GetMmxRegName(x86::Reg reg)
 {
     static const char* names[] = { "mm[0]", "mm[1]", "mm[2]", "mm[3]", "mm[4]", "mm[5]", "mm[6]", "mm[7]" };
-    return reg < 8 ? names[reg] : "???";
+    int idx = reg - x86::MM0;  // MM0 = 8, so MM0-MM7 maps to 0-7
+    return (idx >= 0 && idx < 8) ? names[idx] : "???";
 }
 
 bool X86Recompiler::LoadConfig(const std::string_view& configFilePath)
@@ -56,996 +57,31 @@ bool X86Recompiler::LoadConfig(const std::string_view& configFilePath)
 
 void X86Recompiler::Analyse()
 {
-    // Add manually specified functions from config
+    // Strict TOML-only mode: Only use functions defined in the input TOML config.
+    // No automatic function detection is performed.
+
+    if (config.functions.empty())
+    {
+        fmt::println("ERROR: No functions defined in TOML config. The x86 recompiler requires explicit function definitions.");
+        fmt::println("Add functions to your TOML like:");
+        fmt::println("  [[functions]]");
+        fmt::println("  address = 0x12345");
+        fmt::println("  size = 0x100");
+        return;
+    }
+
+    // Load all functions from config
     for (auto& [address, size] : config.functions)
     {
         functions.emplace_back(address, size);
         image.symbols.emplace(fmt::format("sub_{:X}", address), address, size, Symbol_Function);
     }
-    
-    if (!config.functions.empty())
-    {
-        fmt::println("Loaded {} manually-specified functions from TOML:", config.functions.size());
-        // for (auto& [address, size] : config.functions)
-        // {
-        //     fmt::println("  0x{:X} (size: 0x{:X})", address, size);
-        // }
-    }
 
-    // Helper to check if an address falls within a manually-specified function
-    auto isInManualFunction = [&](uint32_t addr) -> bool {
-        for (const auto& [fnAddr, fnSize] : config.functions)
-        {
-            if (addr >= fnAddr && addr < fnAddr + fnSize)
-                return true;
-        }
-        return false;
-    };
-
-    // Helper to check if an address is close to a manually-specified function start
-    // (within 16 bytes - likely a misdetection of the same function)
-    auto isNearManualFunction = [&](uint32_t addr) -> bool {
-        for (const auto& [fnAddr, fnSize] : config.functions)
-        {
-            // Check if addr is within 16 bytes before or after the manual function start
-            if (addr >= fnAddr - 16 && addr < fnAddr + 16)
-                return true;
-        }
-        return false;
-    };
-
-    // Build a map of section data for quick lookup
-    struct SectionInfo {
-        const uint8_t* data;
-        uint32_t base;
-        uint32_t size;
-        std::string name;
-    };
-    std::vector<SectionInfo> codeSections;  // Code sections with boundary-limited sizes (for finding code)
-    std::vector<SectionInfo> allSections;   // All sections with full sizes (for reading data like jump tables)
-    
-    // Helper to check if an address is in a data range
-    auto isInDataRange = [&](uint32_t addr, const std::string& sectionName) -> bool {
-        auto configIt = config.sectionConfigs.find(sectionName);
-        if (configIt != config.sectionConfigs.end()) {
-            for (const auto& range : configIt->second.dataRanges) {
-                if (addr >= range.start && addr < range.end)
-                    return true;
-            }
-        }
-        return false;
-    };
-    
-    for (const auto& section : image.sections)
-    {
-        // Add to allSections with full size
-        allSections.push_back({section.data, static_cast<uint32_t>(section.base), 
-                               static_cast<uint32_t>(section.size), section.name});
-        
-        if (section.flags & SectionFlags_Code)
-        {
-            uint32_t sectionBase = static_cast<uint32_t>(section.base);
-            uint32_t sectionEnd = sectionBase + static_cast<uint32_t>(section.size);
-            
-            // Check if there's a section config defined for this section
-            auto configIt = config.sectionConfigs.find(section.name);
-            if (configIt != config.sectionConfigs.end())
-            {
-                const auto& sectionConfig = configIt->second;
-                
-                // New format: explicit code_ranges
-                if (!sectionConfig.codeRanges.empty())
-                {
-                    fmt::println("  Code section '{}' with {} code range(s):", 
-                                 section.name, sectionConfig.codeRanges.size());
-                    for (const auto& range : sectionConfig.codeRanges)
-                    {
-                        uint32_t rangeStart = range.start;
-                        uint32_t rangeEnd = range.end;
-                        
-                        // Clamp to section bounds
-                        if (rangeStart < sectionBase) rangeStart = sectionBase;
-                        if (rangeEnd > sectionEnd) rangeEnd = sectionEnd;
-                        
-                        if (rangeStart < rangeEnd)
-                        {
-                            uint32_t offset = rangeStart - sectionBase;
-                            uint32_t size = rangeEnd - rangeStart;
-                            codeSections.push_back({section.data + offset, rangeStart, size, section.name});
-                            fmt::println("    Code range: 0x{:X} - 0x{:X}", rangeStart, rangeEnd);
-                        }
-                    }
-                    if (!sectionConfig.dataRanges.empty())
-                    {
-                        fmt::println("    {} data range(s) defined", sectionConfig.dataRanges.size());
-                    }
-                }
-                // Legacy format: single code_end_address
-                else if (sectionConfig.codeEndAddress != 0)
-                {
-                    uint32_t codeEnd = sectionConfig.codeEndAddress;
-                    if (codeEnd > sectionBase && codeEnd <= sectionEnd)
-                    {
-                        uint32_t codeSize = codeEnd - sectionBase;
-                        fmt::println("  Code section '{}': 0x{:X} - 0x{:X} (manual boundary, data starts at 0x{:X})", 
-                                     section.name, sectionBase, codeEnd, codeEnd);
-                        codeSections.push_back({section.data, sectionBase, codeSize, section.name});
-                    }
-                    else
-                    {
-                        fmt::println("  WARNING: Invalid section boundary for '{}': 0x{:X} is outside section range",
-                                     section.name, codeEnd);
-                        fmt::println("  Code section '{}': 0x{:X} - 0x{:X}", section.name, sectionBase, sectionEnd);
-                        codeSections.push_back({section.data, sectionBase, static_cast<uint32_t>(section.size), section.name});
-                    }
-                }
-                else
-                {
-                    // Config exists but no code ranges or boundary - use full section
-                    fmt::println("  Code section '{}': 0x{:X} - 0x{:X}", section.name, sectionBase, sectionEnd);
-                    codeSections.push_back({section.data, sectionBase, static_cast<uint32_t>(section.size), section.name});
-                }
-            }
-            else
-            {
-                fmt::println("  Code section '{}': 0x{:X} - 0x{:X}", section.name, sectionBase, sectionEnd);
-                codeSections.push_back({section.data, sectionBase, static_cast<uint32_t>(section.size), section.name});
-            }
-        }
-    }
-
-    auto getSectionForAddr = [&](uint32_t addr) -> const SectionInfo* {
-        for (const auto& sec : codeSections)
-        {
-            if (addr >= sec.base && addr < sec.base + sec.size)
-                return &sec;
-        }
-        return nullptr;
-    };
-    
-    // Get any section (including data sections) for reading jump tables etc.
-    auto getAnySectionForAddr = [&](uint32_t addr) -> const SectionInfo* {
-        for (const auto& sec : allSections)
-        {
-            if (addr >= sec.base && addr < sec.base + sec.size)
-                return &sec;
-        }
-        return nullptr;
-    };
-
-    // Phase 1: Recursive descent from entry point to find valid instruction addresses
-    std::set<uint32_t> validInsnAddrs;  // All addresses that are valid instruction starts
-    std::set<uint32_t> callTargets;     // CALL targets found during descent
-    std::vector<uint32_t> workList;
-
-    // Seed with entry point
-    if (image.entry_point != 0)
-    {
-        workList.push_back(static_cast<uint32_t>(image.entry_point));
-        callTargets.insert(static_cast<uint32_t>(image.entry_point));
-    }
-
-    // Process all reachable code
-    while (!workList.empty())
-    {
-        uint32_t startAddr = workList.back();
-        workList.pop_back();
-
-        if (validInsnAddrs.count(startAddr))
-            continue;
-
-        const SectionInfo* sec = getSectionForAddr(startAddr);
-        if (!sec)
-            continue;
-
-        const uint8_t* p = sec->data + (startAddr - sec->base);
-        const uint8_t* pEnd = sec->data + sec->size;
-        uint32_t addr = startAddr;
-
-        while (p < pEnd)
-        {
-            if (validInsnAddrs.count(addr))
-                break;  // Already processed from another path
-            validInsnAddrs.insert(addr);
-
-            x86::Insn insn;
-            int len = x86::Disassemble(p, pEnd - p, addr, insn);
-            if (len <= 0 || insn.type == x86::InsnType::Invalid)
-                break;
-
-            // Track CALL targets
-            if (insn.type == x86::InsnType::Call && insn.is_branch_relative)
-            {
-                auto targetSec = getSectionForAddr(insn.branch_target);
-                if (targetSec && !callTargets.count(insn.branch_target))
-                {
-                    // Debug: trace calls to XPP section
-                    if (insn.branch_target >= 0x362AE0 && insn.branch_target < 0x36B7B0)
-                    {
-                        fmt::println("DEBUG: Found CALL to XPP 0x{:X} from 0x{:X}", insn.branch_target, addr);
-                    }
-                    callTargets.insert(insn.branch_target);
-                    workList.push_back(insn.branch_target);
-                }
-                else if (!targetSec && insn.branch_target >= 0x10000)
-                {
-                    fmt::println("DEBUG: CALL to 0x{:X} from 0x{:X} - target not in any code section!", insn.branch_target, addr);
-                }
-            }
-
-            // Follow control flow
-            if (insn.type == x86::InsnType::Jcc && insn.is_branch_relative)
-            {
-                // Queue branch target
-                if (getSectionForAddr(insn.branch_target) && !validInsnAddrs.count(insn.branch_target))
-                {
-                    workList.push_back(insn.branch_target);
-                }
-                // Continue to fall-through
-                p += len;
-                addr += len;
-            }
-            else if (insn.type == x86::InsnType::Jmp && insn.is_branch_relative)
-            {
-                // Queue target and stop this path
-                if (getSectionForAddr(insn.branch_target) && !validInsnAddrs.count(insn.branch_target))
-                {
-                    workList.push_back(insn.branch_target);
-                }
-                break;
-            }
-            else if (insn.type == x86::InsnType::Ret || 
-                     insn.type == x86::InsnType::JmpIndirect ||
-                     insn.type == x86::InsnType::Int3)
-            {
-                break;
-            }
-            else
-            {
-                p += len;
-                addr += len;
-            }
-        }
-    }
-
-    fmt::println("Phase 1: Found {} valid instruction addresses, {} call targets from entry point",
-                 validInsnAddrs.size(), callTargets.size());
-
-    // Phase 2: Find additional function entry points by looking for:
-    // 1. Common function prologues at aligned addresses
-    // 2. Addresses after terminators (ret, jmp indirect, int3) at aligned boundaries
-    std::set<uint32_t> additionalCallTargets;
-    
-    for (const auto& sec : codeSections)
-    {
-        const uint8_t* data = sec.data;
-        uint32_t addr = sec.base;
-        uint32_t endAddr = sec.base + sec.size;
-
-        while (addr < endAddr - 4)
-        {
-            const uint8_t* p = data + (addr - sec.base);
-            
-            // Check for common function prologues at 16-byte aligned addresses
-            // or addresses right after known terminators
-            bool isPotentialEntry = false;
-            
-            // Check alignment (functions often start at 4 or 16 byte boundaries)
-            if ((addr & 0xF) == 0 || (addr & 0x3) == 0)
-            {
-                // push ebp (0x55) followed by mov ebp, esp (0x8B EC or 0x89 E5)
-                if (p[0] == 0x55 && ((p[1] == 0x8B && p[2] == 0xEC) || (p[1] == 0x89 && p[2] == 0xE5)))
-                {
-                    isPotentialEntry = true;
-                }
-                // push ebx/esi/edi (0x53/0x56/0x57) - common for __fastcall
-                else if (p[0] == 0x53 || p[0] == 0x56 || p[0] == 0x57)
-                {
-                    // Check if followed by more pushes or sub esp
-                    if (p[1] == 0x53 || p[1] == 0x56 || p[1] == 0x57 || p[1] == 0x55 ||
-                        (p[1] == 0x83 && p[2] == 0xEC) || // sub esp, imm8
-                        (p[1] == 0x81 && p[2] == 0xEC))   // sub esp, imm32
-                    {
-                        isPotentialEntry = true;
-                    }
-                }
-                // sub esp, imm (stack frame setup)
-                else if ((p[0] == 0x83 && p[1] == 0xEC) || (p[0] == 0x81 && p[1] == 0xEC))
-                {
-                    isPotentialEntry = true;
-                }
-                // mov edi, edi (hotpatch NOP)
-                else if (p[0] == 0x8B && p[1] == 0xFF)
-                {
-                    isPotentialEntry = true;
-                }
-            }
-            
-            if (isPotentialEntry && !callTargets.count(addr) && !validInsnAddrs.count(addr) && !isInManualFunction(addr) && !isNearManualFunction(addr))
-            {
-                // Verify this isn't inside an instruction we already decoded
-                bool insideKnownInsn = false;
-                for (uint32_t check = addr - 1; check >= addr - 15 && check >= sec.base; check--)
-                {
-                    if (validInsnAddrs.count(check))
-                    {
-                        const uint8_t* checkP = data + (check - sec.base);
-                        x86::Insn checkInsn;
-                        int checkLen = x86::Disassemble(checkP, endAddr - check, check, checkInsn);
-                        if (checkLen > 0 && check + checkLen > addr)
-                        {
-                            insideKnownInsn = true;
-                        }
-                        break;
-                    }
-                }
-                
-                if (!insideKnownInsn)
-                {
-                    additionalCallTargets.insert(addr);
-                }
-            }
-            
-            addr++;
-        }
-    }
-
-    fmt::println("Phase 2a: Found {} potential function prologues",
-                 additionalCallTargets.size());
-
-    // Phase 2b: Scan data sections for function pointers (vtables, callbacks)
-    // These are addresses in data sections that point to code sections
-    size_t dataFuncPtrs = 0;
-    for (const auto& section : image.sections)
-    {
-        // Skip code sections, look at data sections (especially .rdata)
-        if (section.flags & SectionFlags_Code)
-            continue;
-        
-        // Scan for dword-aligned values that look like code addresses
-        const uint32_t* data = reinterpret_cast<const uint32_t*>(section.data);
-        size_t count = section.size / 4;
-        
-        for (size_t i = 0; i < count; i++)
-        {
-            uint32_t value = data[i];
-            
-            // Check if this value points to a code section
-            const SectionInfo* targetSec = getSectionForAddr(value);
-            if (targetSec && !callTargets.count(value) && !additionalCallTargets.count(value) && !isInManualFunction(value) && !isNearManualFunction(value))
-            {
-                // Additional validation: try to disassemble at the target
-                const uint8_t* p = targetSec->data + (value - targetSec->base);
-                x86::Insn insn;
-                int len = x86::Disassemble(p, targetSec->size - (value - targetSec->base), value, insn);
-                
-                if (len > 0 && insn.type != x86::InsnType::Invalid)
-                {
-                    // Looks like a valid function pointer
-                    additionalCallTargets.insert(value);
-                    dataFuncPtrs++;
-                }
-            }
-        }
-    }
-
-    fmt::println("Phase 2b: Found {} potential function pointers in data sections",
-                 dataFuncPtrs);
-
-    // Phase 3: Do recursive descent from each potential entry point
-    // This will find all CALL targets reachable from these functions too
-    for (uint32_t target : additionalCallTargets)
-    {
-        // Skip if already known
-        if (callTargets.count(target))
-            continue;
-
-        // Add and queue for processing
-        callTargets.insert(target);
-        workList.push_back(target);
-    }
-
-    // Process all new functions (recursive descent)
-    while (!workList.empty())
-    {
-        uint32_t startAddr = workList.back();
-        workList.pop_back();
-
-        if (validInsnAddrs.count(startAddr))
-            continue;
-
-        const SectionInfo* sec = getSectionForAddr(startAddr);
-        if (!sec)
-            continue;
-
-        const uint8_t* p = sec->data + (startAddr - sec->base);
-        const uint8_t* pEnd = sec->data + sec->size;
-        uint32_t addr = startAddr;
-
-        while (p < pEnd)
-        {
-            if (validInsnAddrs.count(addr))
-                break;
-            validInsnAddrs.insert(addr);
-
-            x86::Insn insn;
-            int len = x86::Disassemble(p, pEnd - p, addr, insn);
-            if (len <= 0 || insn.type == x86::InsnType::Invalid)
-                break;
-
-            if (insn.type == x86::InsnType::Call && insn.is_branch_relative)
-            {
-                if (getSectionForAddr(insn.branch_target) && !callTargets.count(insn.branch_target))
-                {
-                    callTargets.insert(insn.branch_target);
-                    workList.push_back(insn.branch_target);
-                }
-            }
-
-            if (insn.type == x86::InsnType::Jcc && insn.is_branch_relative)
-            {
-                if (getSectionForAddr(insn.branch_target) && !validInsnAddrs.count(insn.branch_target))
-                {
-                    workList.push_back(insn.branch_target);
-                }
-                p += len;
-                addr += len;
-            }
-            else if (insn.type == x86::InsnType::Jmp && insn.is_branch_relative)
-            {
-                if (getSectionForAddr(insn.branch_target) && !validInsnAddrs.count(insn.branch_target))
-                {
-                    workList.push_back(insn.branch_target);
-                }
-                break;
-            }
-            else if (insn.type == x86::InsnType::Ret || 
-                     insn.type == x86::InsnType::JmpIndirect ||
-                     insn.type == x86::InsnType::Int3)
-            {
-                break;
-            }
-            else
-            {
-                p += len;
-                addr += len;
-            }
-        }
-    }
-
-    fmt::println("Phase 3: Total {} call targets after validation", callTargets.size());
-
-    // Add all validated call targets as functions, unless they're inside/near manually-specified functions
-    for (uint32_t target : callTargets)
-    {
-        if (image.symbols.find(target) == image.symbols.end() && !isInManualFunction(target) && !isNearManualFunction(target))
-        {
-            auto& fn = functions.emplace_back();
-            fn.base = target;
-            fn.size = 0;
-            image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
-        }
-    }
+    fmt::println("Loaded {} functions from TOML config", config.functions.size());
 
     // Sort functions by address
     std::sort(functions.begin(), functions.end(), 
               [](auto& a, auto& b) { return a.base < b.base; });
-
-    // Remove duplicates
-    functions.erase(std::unique(functions.begin(), functions.end(),
-                   [](auto& a, auto& b) { return a.base == b.base; }), 
-                   functions.end());
-
-    // Calculate function sizes based on actual code flow, not next function
-    // A function's size is determined by the furthest instruction reachable from it
-    // We use SECTION boundary, not next function, because functions can overlap
-    // or false functions may exist inside real functions
-    for (size_t i = 0; i < functions.size(); i++)
-    {
-        if (functions[i].size != 0)
-            continue;
-
-        const SectionInfo* sec = getSectionForAddr(functions[i].base);
-        if (!sec)
-            continue;
-
-        // Find max address reachable from this function
-        std::set<uint32_t> funcAddrs;
-        std::vector<uint32_t> funcWorkList;
-        funcWorkList.push_back(functions[i].base);
-        uint32_t maxAddr = functions[i].base;
-
-        // Use SECTION boundary only - don't constrain by next function
-        // This allows proper function size calculation even if there are
-        // false functions detected in the middle
-        uint32_t boundary = sec->base + sec->size;
-
-        while (!funcWorkList.empty())
-        {
-            uint32_t addr = funcWorkList.back();
-            funcWorkList.pop_back();
-
-            if (funcAddrs.count(addr) || addr < functions[i].base || addr >= boundary)
-                continue;
-            funcAddrs.insert(addr);
-
-            const uint8_t* p = sec->data + (addr - sec->base);
-            const uint8_t* pEnd = sec->data + sec->size;
-
-            x86::Insn insn;
-            int len = x86::Disassemble(p, pEnd - p, addr, insn);
-            if (len <= 0)
-                continue;
-
-            uint32_t endAddr = addr + len;
-            if (endAddr > maxAddr)
-                maxAddr = endAddr;
-
-            if (insn.type == x86::InsnType::Jcc && insn.is_branch_relative)
-            {
-                if (insn.branch_target >= functions[i].base && insn.branch_target < boundary)
-                    funcWorkList.push_back(insn.branch_target);
-                funcWorkList.push_back(addr + len);
-            }
-            else if (insn.type == x86::InsnType::Jmp && insn.is_branch_relative)
-            {
-                if (insn.branch_target >= functions[i].base && insn.branch_target < boundary)
-                    funcWorkList.push_back(insn.branch_target);
-            }
-            else if (insn.type != x86::InsnType::Ret && 
-                     insn.type != x86::InsnType::JmpIndirect &&
-                     insn.type != x86::InsnType::Int3)
-            {
-                funcWorkList.push_back(addr + len);
-            }
-        }
-
-        functions[i].size = maxAddr - functions[i].base;
-    }
-
-    // Update symbols with computed sizes
-    for (size_t i = 0; i < functions.size(); i++)
-    {
-        if (functions[i].size == 0)
-        {
-            // Find section for fallback calculation
-            const SectionInfo* sec = getSectionForAddr(functions[i].base);
-            if (sec)
-            {
-                // Use section end as fallback
-                uint32_t endAddress = sec->base + sec->size;
-                if (i + 1 < functions.size() && 
-                    functions[i + 1].base > functions[i].base &&
-                    functions[i + 1].base < endAddress)
-                {
-                    endAddress = functions[i + 1].base;
-                }
-                functions[i].size = endAddress - functions[i].base;
-            }
-        }
-
-        // Update symbol
-        auto it = image.symbols.find(functions[i].base);
-        if (it != image.symbols.end())
-        {
-            Symbol updated = *it;
-            updated.size = functions[i].size;
-            image.symbols.erase(it);
-            image.symbols.insert(updated);
-        }
-    }
-
-    // Phase 4: Ensure all CALL targets from discovered functions are also functions
-    // This catches any functions called by code we discovered that weren't found earlier
-    std::set<uint32_t> missingFunctions;
-    std::set<uint32_t> existingFunctions;
-    for (const auto& fn : functions)
-        existingFunctions.insert(fn.base);
-
-    for (const auto& fn : functions)
-    {
-        const SectionInfo* sec = getSectionForAddr(fn.base);
-        if (!sec)
-            continue;
-
-        const uint8_t* p = sec->data + (fn.base - sec->base);
-        const uint8_t* pEnd = sec->data + sec->size;
-        uint32_t addr = fn.base;
-        uint32_t fnEnd = fn.base + fn.size;
-
-        while (addr < fnEnd && p < pEnd)
-        {
-            x86::Insn insn;
-            int len = x86::Disassemble(p, pEnd - p, addr, insn);
-            if (len <= 0)
-                break;
-
-            if (insn.type == x86::InsnType::Call && insn.is_branch_relative)
-            {
-                uint32_t target = insn.branch_target;
-                if (getSectionForAddr(target) && 
-                    !existingFunctions.count(target) &&
-                    !missingFunctions.count(target) &&
-                    !isInManualFunction(target) &&
-                    !isNearManualFunction(target))
-                {
-                    missingFunctions.insert(target);
-                }
-            }
-            
-            // Also check for JMP targets that go outside this function's boundaries
-            // These are often "function chunks" - code that belongs to this function
-            // but was placed elsewhere by the compiler
-            if (insn.type == x86::InsnType::Jmp && insn.is_branch_relative)
-            {
-                uint32_t target = insn.branch_target;
-                // If jump target is outside this function's bounds, it's a chunk
-                if (target < fn.base || target >= fn.base + fn.size)
-                {
-                    if (getSectionForAddr(target) && 
-                        !existingFunctions.count(target) &&
-                        !missingFunctions.count(target) &&
-                        !isInManualFunction(target) &&
-                        !isNearManualFunction(target))
-                    {
-                        missingFunctions.insert(target);
-                    }
-                }
-            }
-
-            p += len;
-            addr += len;
-        }
-    }
-
-    // Add missing functions
-    if (!missingFunctions.empty())
-    {
-        fmt::println("Phase 4: Found {} additional targets (calls + function chunks)", missingFunctions.size());
-        
-        for (uint32_t target : missingFunctions)
-        {
-            auto& fn = functions.emplace_back();
-            fn.base = target;
-            fn.size = 0;
-            image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
-        }
-
-        // Re-sort and calculate sizes for new functions
-        std::sort(functions.begin(), functions.end(), 
-                  [](auto& a, auto& b) { return a.base < b.base; });
-
-        for (size_t i = 0; i < functions.size(); i++)
-        {
-            if (functions[i].size != 0)
-                continue;
-
-            const SectionInfo* sec = getSectionForAddr(functions[i].base);
-            if (!sec)
-                continue;
-
-            uint32_t endAddress = sec->base + sec->size;
-            if (i + 1 < functions.size() && 
-                functions[i + 1].base > functions[i].base &&
-                functions[i + 1].base < endAddress)
-            {
-                endAddress = functions[i + 1].base;
-            }
-            functions[i].size = endAddress - functions[i].base;
-
-            auto it = image.symbols.find(functions[i].base);
-            if (it != image.symbols.end())
-            {
-                Symbol updated = *it;
-                updated.size = functions[i].size;
-                image.symbols.erase(it);
-                image.symbols.insert(updated);
-            }
-        }
-    }
-
-    // Phase 5: Remove false positives - functions that are reachable from another function
-    // This happens when prologue patterns like "push esi; push edi" appear mid-function
-    // We check if the function's address is reachable via control flow from an earlier function
-    // IMPORTANT: We mark ALL bytes within each instruction as "covered" to catch addresses
-    // that fall in the middle of multi-byte instructions
-    {
-        std::map<uint32_t, uint32_t> addrToFunc;  // Maps address to function that covers it
-        
-        // Build a set of all function entry points - jumps to these are tail calls, not internal flow
-        std::set<uint32_t> functionEntryPoints;
-        for (const auto& fn : functions)
-        {
-            functionEntryPoints.insert(fn.base);
-        }
-        
-        // First, calculate coverage for each function (all bytes within all reachable instructions)
-        for (const auto& fn : functions)
-        {
-            const SectionInfo* sec = getSectionForAddr(fn.base);
-            if (!sec) continue;
-            
-            std::vector<uint32_t> workList;
-            std::set<uint32_t> visitedInsns;  // Track visited instruction starts
-            workList.push_back(fn.base);
-            
-            while (!workList.empty())
-            {
-                uint32_t addr = workList.back();
-                workList.pop_back();
-                
-                // Don't follow control flow into OTHER functions (tail calls)
-                // But DO process our own entry point
-                if (addr != fn.base && functionEntryPoints.count(addr))
-                    continue;
-                
-                if (visitedInsns.count(addr) || addr < sec->base || addr >= sec->base + sec->size)
-                    continue;
-                visitedInsns.insert(addr);
-                
-                const uint8_t* p = sec->data + (addr - sec->base);
-                x86::Insn insn;
-                int len = x86::Disassemble(p, sec->size - (addr - sec->base), addr, insn);
-                if (len <= 0) continue;
-                
-                // Mark ALL bytes within this instruction as covered by this function
-                // This catches false functions that start mid-instruction
-                for (int b = 0; b < len; b++)
-                {
-                    uint32_t byteAddr = addr + b;
-                    if (byteAddr != fn.base && addrToFunc.find(byteAddr) == addrToFunc.end())
-                    {
-                        addrToFunc[byteAddr] = fn.base;
-                    }
-                }
-                
-                if (insn.type == x86::InsnType::Jcc && insn.is_branch_relative)
-                {
-                    workList.push_back(insn.branch_target);
-                    workList.push_back(addr + len);
-                }
-                else if (insn.type == x86::InsnType::Jmp && insn.is_branch_relative)
-                {
-                    workList.push_back(insn.branch_target);
-                }
-                else if (insn.type == x86::InsnType::JmpIndirect)
-                {
-                    // JmpIndirect is ALWAYS a terminator - execution never falls through
-                    // This handles both:
-                    // 1. Switch tables (jmp dword ptr [reg*4 + tableAddr]) - targets added to worklist
-                    // 2. Import jumps (jmp dword ptr [import_addr]) - no fallthrough to next insn
-                    
-                    // Try to detect and read switch table for reachability
-                    // Pattern: jmp dword ptr [reg*4 + tableAddr]
-                    const auto& op = insn.op[0];
-                    if (op.type == x86::OpType::Mem && op.scale == 4 && op.base == x86::X86_REG_NONE)
-                    {
-                        uint32_t tableAddr = static_cast<uint32_t>(op.disp);
-                        // Use getAnySectionForAddr since jump table data may be outside code boundaries
-                        const SectionInfo* tableSec = getAnySectionForAddr(tableAddr);
-                        
-                        if (tableSec)
-                        {
-                            const uint8_t* tableData = tableSec->data + (tableAddr - tableSec->base);
-                            size_t maxEntries = (tableSec->size - (tableAddr - tableSec->base)) / 4;
-                            if (maxEntries > 256) maxEntries = 256;
-                            
-                            // Debug: print first few entries of the table
-                            //fmt::println("  Switch table at 0x{:X} (insn at 0x{:X}), section '{}' base=0x{:X}:", 
-                            //             tableAddr, addr, tableSec->name, tableSec->base);
-                            for (size_t dbg = 0; dbg < (std::min)(size_t(5), maxEntries); dbg++)
-                            {
-                                uint32_t dbgTarget = *reinterpret_cast<const uint32_t*>(tableData + dbg * 4);
-                                //fmt::println("    [{}] = 0x{:X}", dbg, dbgTarget);
-                            }
-                            
-                            std::vector<uint32_t> targets;
-                            for (size_t j = 0; j < maxEntries; j++)
-                            {
-                                uint32_t target = *reinterpret_cast<const uint32_t*>(tableData + j * 4);
-                                // Targets must be in code sections
-                                const SectionInfo* targetSec = getSectionForAddr(target);
-                                if (!targetSec)
-                                {
-                                    //fmt::println("    Entry {} (0x{:X}) not in code section, stopping", j, target);
-                                    break;
-                                }
-                                if (target < fn.base - 0x1000 || target > fn.base + 0x10000)
-                                {
-                                    //fmt::println("    Entry {} (0x{:X}) out of range from fn 0x{:X}, stopping", j, target, fn.base);
-                                    break;
-                                }
-                                workList.push_back(target);
-                                targets.push_back(target);
-                            }
-                            
-                            //fmt::println("    Total valid entries: {}", targets.size());
-                            
-                            // Store the detected switch table in config for recompilation
-                            if (!targets.empty() && config.switchTables.find(addr) == config.switchTables.end())
-                            {
-                                X86RecompilerSwitchTable switchTable;
-                                switchTable.reg = static_cast<uint32_t>(op.index);
-                                switchTable.defaultLabel = 0;
-                                switchTable.labels = targets;
-                                config.switchTables.emplace(addr, std::move(switchTable));
-                            }
-                            
-                            // Mark all bytes in the switch table data as covered
-                            // This prevents false functions from being detected in table data
-                            size_t validEntries = targets.size();
-                            for (size_t j = 0; j < validEntries * 4; j++)
-                            {
-                                uint32_t tableByteAddr = tableAddr + j;
-                                if (tableByteAddr != fn.base && addrToFunc.find(tableByteAddr) == addrToFunc.end())
-                                {
-                                    addrToFunc[tableByteAddr] = fn.base;
-                                }
-                            }
-                        }
-                    }
-                    // NOTE: JmpIndirect does NOT add addr + len - control never falls through
-                }
-                else if (insn.type == x86::InsnType::Jmp)
-                {
-                    // Non-relative Jmp (call reg, call [mem]) - also a terminator
-                    // The target is unknown at static analysis time, so don't add fallthrough
-                }
-                else if (insn.type != x86::InsnType::Ret && 
-                         insn.type != x86::InsnType::Int3)
-                {
-                    workList.push_back(addr + len);
-                }
-            }
-        }
-        
-        // Remove functions whose start address is reachable from an earlier function
-        // EXCEPT for manually-specified functions from TOML - always keep those
-        std::vector<Function> filteredFunctions;
-        size_t removed = 0;
-        
-        for (const auto& fn : functions)
-        {
-            // Check if this is a manually-specified function
-            bool isManualFunction = config.functions.find(fn.base) != config.functions.end();
-            
-            auto it = addrToFunc.find(fn.base);
-            if (!isManualFunction && it != addrToFunc.end() && it->second < fn.base)
-            {
-                // This function's start is reachable from an earlier function
-                // and it's not manually specified, so remove it
-                removed++;
-                fmt::println("  Removing false positive: 0x{:X} (covered by 0x{:X})", fn.base, it->second);
-                auto symIt = image.symbols.find(fn.base);
-                if (symIt != image.symbols.end())
-                    image.symbols.erase(symIt);
-            }
-            else if (isManualFunction && it != addrToFunc.end() && it->second < fn.base)
-            {
-                fmt::println("  Keeping manual function 0x{:X} despite coverage by 0x{:X}", fn.base, it->second);
-            }
-            else
-            {
-                filteredFunctions.push_back(fn);
-            }
-        }
-        
-        if (removed > 0)
-        {
-            fmt::println("Phase 5: Removed {} false positive functions (covered by earlier functions)", removed);
-            functions = std::move(filteredFunctions);
-        }
-    }
-    
-    // Recalculate function sizes after removing false positives
-    // This includes following switch table entries for indirect jumps
-    for (size_t i = 0; i < functions.size(); i++)
-    {
-        const SectionInfo* sec = getSectionForAddr(functions[i].base);
-        if (!sec) continue;
-        
-        std::set<uint32_t> funcAddrs;
-        std::vector<uint32_t> workList;
-        workList.push_back(functions[i].base);
-        uint32_t maxAddr = functions[i].base;
-        
-        while (!workList.empty())
-        {
-            uint32_t addr = workList.back();
-            workList.pop_back();
-            
-            if (funcAddrs.count(addr) || addr < sec->base || addr >= sec->base + sec->size)
-                continue;
-            funcAddrs.insert(addr);
-            
-            const uint8_t* p = sec->data + (addr - sec->base);
-            x86::Insn insn;
-            int len = x86::Disassemble(p, sec->size - (addr - sec->base), addr, insn);
-            if (len <= 0) continue;
-            
-            uint32_t endAddr = addr + len;
-            if (endAddr > maxAddr)
-                maxAddr = endAddr;
-            
-            if (insn.type == x86::InsnType::Jcc && insn.is_branch_relative)
-            {
-                workList.push_back(insn.branch_target);
-                workList.push_back(addr + len);
-            }
-            else if (insn.type == x86::InsnType::Jmp && insn.is_branch_relative)
-            {
-                workList.push_back(insn.branch_target);
-            }
-            else if (insn.type == x86::InsnType::JmpIndirect)
-            {
-                // Try to detect and read switch table
-                // Pattern: jmp dword ptr [reg*4 + tableAddr]
-                const auto& op = insn.op[0];
-                if (op.type == x86::OpType::Mem && op.scale == 4 && op.base == x86::X86_REG_NONE)
-                {
-                    // This looks like a switch table: jmp [reg*4 + disp32]
-                    uint32_t tableAddr = static_cast<uint32_t>(op.disp);
-                    // Use getAnySectionForAddr since jump table data may be outside code boundaries
-                    const SectionInfo* tableSec = getAnySectionForAddr(tableAddr);
-                    
-                    if (tableSec)
-                    {
-                        // Read switch table entries
-                        // We don't know the exact count, so read until we hit invalid entries
-                        const uint8_t* tableData = tableSec->data + (tableAddr - tableSec->base);
-                        size_t maxEntries = (tableSec->size - (tableAddr - tableSec->base)) / 4;
-                        if (maxEntries > 256) maxEntries = 256;  // Reasonable limit
-                        
-                        std::vector<uint32_t> targets;
-                        for (size_t j = 0; j < maxEntries; j++)
-                        {
-                            uint32_t target = *reinterpret_cast<const uint32_t*>(tableData + j * 4);
-                            
-                            // Validate: target should be in a code section and near this function
-                            const SectionInfo* targetSec = getSectionForAddr(target);
-                            if (!targetSec)
-                                break;
-                            
-                            // Target should be reasonably close to function start (within 64KB)
-                            if (target < functions[i].base - 0x1000 || target > functions[i].base + 0x10000)
-                                break;
-                            
-                            // Looks valid, add to worklist
-                            workList.push_back(target);
-                            targets.push_back(target);
-                        }
-                        
-                        // Store detected switch table in config
-                        if (!targets.empty() && config.switchTables.find(addr) == config.switchTables.end())
-                        {
-                            X86RecompilerSwitchTable switchTable;
-                            switchTable.reg = static_cast<uint32_t>(op.index);
-                            switchTable.defaultLabel = 0;
-                            switchTable.labels = std::move(targets);
-                            config.switchTables.emplace(addr, std::move(switchTable));
-                        }
-                    }
-                }
-            }
-            else if (insn.type != x86::InsnType::Ret && 
-                     insn.type != x86::InsnType::Int3)
-            {
-                workList.push_back(addr + len);
-            }
-        }
-        
-        functions[i].size = maxAddr - functions[i].base;
-        
-        // Update symbol
-        auto it = image.symbols.find(functions[i].base);
-        if (it != image.symbols.end())
-        {
-            Symbol updated = *it;
-            updated.size = functions[i].size;
-            image.symbols.erase(it);
-            image.symbols.insert(updated);
-        }
-    }
 
     // Build the functionEntryPoints set for tail call detection during recompilation
     functionEntryPoints.clear();
@@ -1054,33 +90,25 @@ void X86Recompiler::Analyse()
         functionEntryPoints.insert(fn.base);
     }
 
-    fmt::println("Found {} functions", functions.size());
-    
-    // Verify all manual functions are present
-    // if (!config.functions.empty())
-    // {
-    //     fmt::println("\nVerifying manual functions:");
-    //     for (const auto& [addr, size] : config.functions)
-    //     {
-    //         bool found = false;
-    //         for (const auto& fn : functions)
-    //         {
-    //             if (fn.base == addr)
-    //             {
-    //                 found = true;
-    //                 break;
-    //             }
-    //         }
-    //         if (found)
-    //         {
-    //             fmt::println("  ✓ 0x{:X} present", addr);
-    //         }
-    //         else
-    //         {
-    //             fmt::println("  ✗ 0x{:X} MISSING - this function was removed during analysis!", addr);
-    //         }
-    //     }
-    // }
+    // Also add function chunks as known entry points (for control flow analysis)
+    for (const auto& [parentAddr, chunks] : config.functionChunks)
+    {
+        for (const auto& [chunkAddr, chunkSize] : chunks)
+        {
+            // Note: chunks are part of their parent function, not separate functions
+            // but we track them for label generation
+            fmt::println("  Function 0x{:X} has chunk at 0x{:X} (size: 0x{:X})", 
+                         parentAddr, chunkAddr, chunkSize);
+        }
+    }
+
+    // Report switch tables loaded from TOML
+    if (!config.switchTables.empty())
+    {
+        fmt::println("Loaded {} switch tables from TOML config", config.switchTables.size());
+    }
+
+    fmt::println("Analysis complete: {} functions ready for recompilation", functions.size());
 }
 
 std::string X86Recompiler::FormatOperand(const x86::Operand& op, int size, X86RecompilerLocalVariables& locals)
@@ -1100,6 +128,18 @@ std::string X86Recompiler::FormatOperand(const x86::Operand& op, int size, X86Re
         case x86::EBP: locals.ebp = true; break;
         case x86::ESI: locals.esi = true; break;
         case x86::EDI: locals.edi = true; break;
+        // High-byte registers use their parent register
+        case x86::AH: locals.eax = true; break;
+        case x86::CH: locals.ecx = true; break;
+        case x86::DH: locals.edx = true; break;
+        case x86::BH: locals.ebx = true; break;
+        }
+
+        // Handle high-byte registers (AH, CH, DH, BH)
+        if (op.reg >= x86::AH && op.reg <= x86::BH)
+        {
+            static const char* hiByteRegNames[] = { "eax", "ecx", "edx", "ebx" };
+            return fmt::format("ctx.{}.bytes.hi", hiByteRegNames[op.reg - x86::AH]);
         }
 
         if (size == 4)
@@ -1213,6 +253,18 @@ std::string X86Recompiler::FormatOperandWrite(const x86::Operand& op, const std:
         case x86::EBP: locals.ebp = true; break;
         case x86::ESI: locals.esi = true; break;
         case x86::EDI: locals.edi = true; break;
+        // High-byte registers use their parent register
+        case x86::AH: locals.eax = true; break;
+        case x86::CH: locals.ecx = true; break;
+        case x86::DH: locals.edx = true; break;
+        case x86::BH: locals.ebx = true; break;
+        }
+
+        // Handle high-byte registers (AH, CH, DH, BH)
+        if (op.reg >= x86::AH && op.reg <= x86::BH)
+        {
+            static const char* hiByteRegNames[] = { "eax", "ecx", "edx", "ebx" };
+            return fmt::format("ctx.{}.bytes.hi = static_cast<uint8_t>({})", hiByteRegNames[op.reg - x86::AH], value);
         }
 
         if (size == 4)
@@ -1498,6 +550,26 @@ bool X86Recompiler::RecompileInstruction(
         print("{:02X} ", data[i]);
     println("");
 
+    // Helper to check if an address is within the function body or its chunks
+    auto isInFunctionOrChunks = [&](uint32_t target) -> bool
+    {
+        // Check main function body
+        if (target >= effectiveBase && target < effectiveEnd)
+            return true;
+        
+        // Check chunks
+        auto chunksIt = config.functionChunks.find(fn.base);
+        if (chunksIt != config.functionChunks.end())
+        {
+            for (const auto& [chunkAddr, chunkSize] : chunksIt->second)
+            {
+                if (target >= chunkAddr && target < chunkAddr + chunkSize)
+                    return true;
+            }
+        }
+        return false;
+    };
+
     auto printFunctionCall = [&, address](uint32_t target)
     {
         // Check if target is within current function (call to a label, not a function)
@@ -1529,10 +601,14 @@ bool X86Recompiler::RecompileInstruction(
             }
         }
         
-        if (isInMainBody || isInChunk)
+        // If target is a known function entry point (including our own for recursive calls),
+        // emit a proper function call rather than a goto
+        bool isKnownFunction = functionEntryPoints.count(target) > 0;
+        
+        if ((isInMainBody || isInChunk) && !isKnownFunction)
         {
             // This is a call to a label within the current function or its chunks
-            // Push return address and goto the label
+            // (not a function entry point) - Push return address and goto the label
             localVariables.esp = true;
             println("\tctx.esp.u32 -= 4;");
             println("\tX86_STORE_U32(ctx.esp.u32, 0x{:X});", address + insn.length); // Return address
@@ -1540,14 +616,31 @@ bool X86Recompiler::RecompileInstruction(
             return;
         }
         
+        // Check if target is a TOML-defined function
+        bool isDefinedInToml = isKnownFunction;
+        
+        // Simulate the 'call' instruction by pushing a return address onto the stack.
+        // The callee expects [esp+0] to be the return address, with parameters at [esp+4], [esp+8], etc.
+        // Without this, stack parameter accesses would be off by 4 bytes.
+        localVariables.esp = true;
+        println("\tctx.esp.u32 -= 4;");
+        println("\tX86_STORE_U32(ctx.esp.u32, 0x{:X}u); // return address", address + insn.length);
+        
         auto targetSymbol = image.symbols.find(target);
         if (targetSymbol != image.symbols.end() && targetSymbol->address == target && targetSymbol->type == Symbol_Function)
         {
+            // Has a symbol name - use it
             println("\t{}(ctx, base);", targetSymbol->name);
+            if (!isDefinedInToml)
+            {
+                // Track this as an undefined function that needs a stub
+                referencedUndefinedFunctions.insert(target);
+            }
         }
         else
         {
-            // Check if this might be a function chunk we missed
+            // No symbol - generate sub_XXXX name
+            // Check if this is in a code section
             bool isInCodeSection = false;
             for (const auto& section : image.sections)
             {
@@ -1561,15 +654,21 @@ bool X86Recompiler::RecompileInstruction(
             
             if (isInCodeSection)
             {
-                // Generate a call anyway - assume it's a function chunk
                 println("\tsub_{:X}(ctx, base);", target);
-                println("\t// WARNING: Function chunk at {:X} - may need manual verification", target);
+                if (!isDefinedInToml)
+                {
+                    // Track this as an undefined function that needs a stub
+                    referencedUndefinedFunctions.insert(target);
+                }
             }
             else
             {
                 println("\t// ERROR: Unknown function at {:X}", target);
             }
         }
+        
+        // Pop the simulated return address after the call returns
+        println("\tctx.esp.u32 += 4;");
     };
 
     auto printConditionalJump = [&](const char* cond, uint32_t target)
@@ -1712,6 +811,26 @@ bool X86Recompiler::RecompileInstruction(
         std::string src = FormatOperandRead(insn.op[1], 4, localVariables);
         println("\t{};", FormatOperandWrite(insn.op[0],
             fmt::format("x86_sub<int32_t>({}, {}, ctx.eflags)", dst, src), 4, localVariables));
+        break;
+    }
+
+    case x86::InsnType::Adc:
+    {
+        localVariables.eflags = true;
+        std::string dst = FormatOperandRead(insn.op[0], 4, localVariables);
+        std::string src = FormatOperandRead(insn.op[1], 4, localVariables);
+        println("\t{};", FormatOperandWrite(insn.op[0],
+            fmt::format("x86_adc<int32_t>({}, {}, ctx.eflags)", dst, src), 4, localVariables));
+        break;
+    }
+
+    case x86::InsnType::Sbb:
+    {
+        localVariables.eflags = true;
+        std::string dst = FormatOperandRead(insn.op[0], 4, localVariables);
+        std::string src = FormatOperandRead(insn.op[1], 4, localVariables);
+        println("\t{};", FormatOperandWrite(insn.op[0],
+            fmt::format("x86_sbb<int32_t>({}, {}, ctx.eflags)", dst, src), 4, localVariables));
         break;
     }
 
@@ -2684,7 +1803,7 @@ bool X86Recompiler::RecompileInstruction(
             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
             {
                 auto label = switchTable->second.labels[i];
-                if (label < effectiveBase || label >= effectiveEnd)
+                if (!isInFunctionOrChunks(label))
                 {
                     println("\tcase {}:", i);
                     println("\t\t// ERROR: Switch case {:X} jumps outside function", label);
@@ -2720,8 +1839,12 @@ bool X86Recompiler::RecompileInstruction(
         }
         else
         {
-            // Indirect call
+            // Indirect call - simulate push/pop of return address
+            localVariables.esp = true;
+            println("\tctx.esp.u32 -= 4;");
+            println("\tX86_STORE_U32(ctx.esp.u32, 0x{:X}u); // return address", address + insn.length);
             println("\tX86_CALL_INDIRECT_FUNC({});", FormatOperandRead(insn.op[0], 4, localVariables));
+            println("\tctx.esp.u32 += 4;");
         }
         break;
 
@@ -2787,7 +1910,7 @@ bool X86Recompiler::RecompileInstruction(
         else if (insn.op[0].type == x86::OpType::Reg)
         {
             // Memory to XMM: loads 32 bits, zeros upper bits
-            auto addr = FormatOperand(insn.op[1], 4, localVariables);
+            auto addr = FormatMemoryAddress(insn.op[1], localVariables);
             localVariables.xmm[insn.op[0].reg] = true;
             println("\tctx.{}.m128 = X86_LOAD_XMM_SS({});", GetXmmRegName(insn.op[0].reg), addr);
         }
@@ -2795,7 +1918,7 @@ bool X86Recompiler::RecompileInstruction(
         {
             // XMM to Memory: stores lower 32 bits
             auto src = FormatXmmOperandRead(insn.op[1], localVariables);
-            auto addr = FormatOperand(insn.op[0], 4, localVariables);
+            auto addr = FormatMemoryAddress(insn.op[0], localVariables);
             println("\tX86_STORE_XMM_SS({}, {});", addr, src);
         }
         break;
@@ -2812,7 +1935,7 @@ bool X86Recompiler::RecompileInstruction(
         else if (insn.op[0].type == x86::OpType::Reg)
         {
             // Memory to XMM: loads 64 bits, zeros upper bits
-            auto addr = FormatOperand(insn.op[1], 4, localVariables);
+            auto addr = FormatMemoryAddress(insn.op[1], localVariables);
             localVariables.xmm[insn.op[0].reg] = true;
             println("\tctx.{}.m128d = X86_LOAD_XMM_SD({});", GetXmmRegName(insn.op[0].reg), addr);
         }
@@ -2820,7 +1943,7 @@ bool X86Recompiler::RecompileInstruction(
         {
             // XMM to Memory: stores lower 64 bits
             auto src = FormatXmmOperandRead(insn.op[1], localVariables);
-            auto addr = FormatOperand(insn.op[0], 4, localVariables);
+            auto addr = FormatMemoryAddress(insn.op[0], localVariables);
             println("\tX86_STORE_XMM_SD({}, simde_mm_castps_pd({}));", addr, src);
         }
         break;
@@ -4899,7 +4022,7 @@ bool X86Recompiler::RecompileInstruction(
         // For recompilation, treat as regular store
         int srcIdx = insn.op[1].reg - x86::XMM0;
         std::string addr = FormatMemoryAddress(insn.op[0], localVariables);
-        println("\t_mm_storeu_ps(reinterpret_cast<float*>(base + ({})), ctx.xmm[{}].ps);", addr, srcIdx);
+        println("\tsimde_mm_storeu_ps(reinterpret_cast<float*>(base + ({})), ctx.xmm{}.m128);", addr, srcIdx);
         break;
     }
 
@@ -4918,13 +4041,15 @@ bool X86Recompiler::RecompileInstruction(
 
     case x86::InsnType::Pushfd:
         // PUSHF/PUSHFD - Push EFLAGS onto stack
+        localVariables.eflags = true;
         println("\tctx.esp.u32 -= 4;");
-        println("\tX86_STORE_U32(ctx.esp.u32, ctx.eflags);");
+        println("\tX86_STORE_U32(ctx.esp.u32, ctx.eflags.pack());");
         break;
 
     case x86::InsnType::Popfd:
         // POPF/POPFD - Pop EFLAGS from stack
-        println("\tctx.eflags = X86_LOAD_U32(ctx.esp.u32);");
+        localVariables.eflags = true;
+        println("\tctx.eflags.unpack(X86_LOAD_U32(ctx.esp.u32));");
         println("\tctx.esp.u32 += 4;");
         break;
 
@@ -5005,14 +4130,15 @@ bool X86Recompiler::RecompileInstruction(
         // if (EAX == dst) { ZF=1; dst = src; } else { ZF=0; EAX = dst; }
         std::string dst = FormatOperand(insn.op[0], 4, localVariables);
         std::string src = FormatOperandRead(insn.op[1], 4, localVariables);
+        localVariables.eflags = true;
         println("\t{{");
         println("\t\tuint32_t temp = {};", dst);
         println("\t\tif (ctx.eax.u32 == temp) {{");
         println("\t\t\t{} = {};", dst, src);
-        println("\t\t\tctx.eflags |= 0x40; // ZF=1");
+        println("\t\t\tctx.eflags.zf = 1;");
         println("\t\t}} else {{");
         println("\t\t\tctx.eax.u32 = temp;");
-        println("\t\t\tctx.eflags &= ~0x40; // ZF=0");
+        println("\t\t\tctx.eflags.zf = 0;");
         println("\t\t}}");
         println("\t}}");
         break;
@@ -5041,11 +4167,11 @@ bool X86Recompiler::RecompileInstruction(
         {
             int srcIdx = insn.op[1].reg - x86::XMM0;
             if (insn.type == x86::InsnType::Cvttps2pi) {
-                println("\tctx.mm[{}].s32[0] = static_cast<int32_t>(ctx.xmm[{}].f32[0]);", dstIdx, srcIdx);
-                println("\tctx.mm[{}].s32[1] = static_cast<int32_t>(ctx.xmm[{}].f32[1]);", dstIdx, srcIdx);
+                println("\tctx.mm[{}].s32[0] = static_cast<int32_t>(ctx.xmm{}.f32[0]);", dstIdx, srcIdx);
+                println("\tctx.mm[{}].s32[1] = static_cast<int32_t>(ctx.xmm{}.f32[1]);", dstIdx, srcIdx);
             } else {
-                println("\tctx.mm[{}].s32[0] = static_cast<int32_t>(std::round(ctx.xmm[{}].f32[0]));", dstIdx, srcIdx);
-                println("\tctx.mm[{}].s32[1] = static_cast<int32_t>(std::round(ctx.xmm[{}].f32[1]));", dstIdx, srcIdx);
+                println("\tctx.mm[{}].s32[0] = static_cast<int32_t>(std::round(ctx.xmm{}.f32[0]));", dstIdx, srcIdx);
+                println("\tctx.mm[{}].s32[1] = static_cast<int32_t>(std::round(ctx.xmm{}.f32[1]));", dstIdx, srcIdx);
             }
         }
         else
@@ -5112,14 +4238,20 @@ bool X86Recompiler::RecompileInstruction(
         break;
 
     case x86::InsnType::Ldmxcsr:
+    {
         // Load MXCSR register - controls SSE rounding/exceptions
-        println("\t// LDMXCSR - SSE control register load");
+        auto addr = FormatMemoryAddress(insn.op[0], localVariables);
+        println("\tctx.mxcsr.value = X86_LOAD_U32({});", addr);
         break;
+    }
 
     case x86::InsnType::Stmxcsr:
+    {
         // Store MXCSR register
-        println("\t// STMXCSR - SSE control register store");
+        auto addr = FormatMemoryAddress(insn.op[0], localVariables);
+        println("\tX86_STORE_U32({}, ctx.mxcsr.value);", addr);
         break;
+    }
 
     case x86::InsnType::Fxsave:
     case x86::InsnType::Fxrstor:
@@ -5189,20 +4321,50 @@ bool X86Recompiler::RecompileInstruction(
     case x86::InsnType::Cvtpi2ps:
         // Convert packed dword integers (MMX) to packed single-precision floats
         {
-            auto src = FormatOperandRead(insn.op[1], 8, localVariables);
-            auto dstReg = GetXmmRegName(insn.op[0].reg);
-            println("\tctx.{}.f32[0] = static_cast<float>(reinterpret_cast<int32_t*>(&{})[0]);", dstReg, src);
-            println("\tctx.{}.f32[1] = static_cast<float>(reinterpret_cast<int32_t*>(&{})[1]);", dstReg, src);
+            int dstIdx = insn.op[0].reg - x86::XMM0;
+            if (insn.op[1].type == x86::OpType::Reg)
+            {
+                // Source is MMX register
+                int srcIdx = insn.op[1].reg - x86::MM0;
+                println("\tctx.xmm{}.f32[0] = static_cast<float>(ctx.mm[{}].s32[0]);", dstIdx, srcIdx);
+                println("\tctx.xmm{}.f32[1] = static_cast<float>(ctx.mm[{}].s32[1]);", dstIdx, srcIdx);
+            }
+            else
+            {
+                // Source is memory
+                std::string addr = FormatMemoryAddress(insn.op[1], localVariables);
+                println("\t{{");
+                println("\t\tunion {{ uint64_t u64; int32_t s32[2]; }} src;");
+                println("\t\tsrc.u64 = X86_LOAD_U64({});", addr);
+                println("\t\tctx.xmm{}.f32[0] = static_cast<float>(src.s32[0]);", dstIdx);
+                println("\t\tctx.xmm{}.f32[1] = static_cast<float>(src.s32[1]);", dstIdx);
+                println("\t}}");
+            }
         }
         break;
 
     case x86::InsnType::Cvtpi2pd:
         // Convert packed dword integers (MMX) to packed double-precision floats
         {
-            auto src = FormatOperandRead(insn.op[1], 8, localVariables);
-            auto dstReg = GetXmmRegName(insn.op[0].reg);
-            println("\tctx.{}.f64[0] = static_cast<double>(reinterpret_cast<int32_t*>(&{})[0]);", dstReg, src);
-            println("\tctx.{}.f64[1] = static_cast<double>(reinterpret_cast<int32_t*>(&{})[1]);", dstReg, src);
+            int dstIdx = insn.op[0].reg - x86::XMM0;
+            if (insn.op[1].type == x86::OpType::Reg)
+            {
+                // Source is MMX register
+                int srcIdx = insn.op[1].reg - x86::MM0;
+                println("\tctx.xmm{}.f64[0] = static_cast<double>(ctx.mm[{}].s32[0]);", dstIdx, srcIdx);
+                println("\tctx.xmm{}.f64[1] = static_cast<double>(ctx.mm[{}].s32[1]);", dstIdx, srcIdx);
+            }
+            else
+            {
+                // Source is memory
+                std::string addr = FormatMemoryAddress(insn.op[1], localVariables);
+                println("\t{{");
+                println("\t\tunion {{ uint64_t u64; int32_t s32[2]; }} src;");
+                println("\t\tsrc.u64 = X86_LOAD_U64({});", addr);
+                println("\t\tctx.xmm{}.f64[0] = static_cast<double>(src.s32[0]);", dstIdx);
+                println("\t\tctx.xmm{}.f64[1] = static_cast<double>(src.s32[1]);", dstIdx);
+                println("\t}}");
+            }
         }
         break;
 
@@ -5375,10 +4537,10 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
     auto tomlIt = config.functions.find(fn.base);
     if (tomlIt != config.functions.end())
     {
-        fmt::println("DEBUG AnalyzeControlFlow: fn.base=0x{:X}, fn.size=0x{:X} (from param), TOML size=0x{:X}", 
-            fn.base, fn.size, tomlIt->second);
         if (fn.size != tomlIt->second)
         {
+            fmt::println("DEBUG AnalyzeControlFlow: fn.base=0x{:X}, fn.size=0x{:X} (from param), TOML size=0x{:X}", 
+                fn.base, fn.size, tomlIt->second);
             fmt::println("WARNING: fn.size mismatch! Using TOML size.");
         }
     }
@@ -5444,6 +4606,16 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
         return getSectionForAddress(addr) != nullptr;
     };
 
+    // Helper to check if an address falls within any invalid region
+    auto isInInvalidRegion = [&](uint32_t addr) -> bool {
+        for (const auto& [invalidStart, invalidSize] : config.invalidAddresses)
+        {
+            if (addr >= invalidStart && addr < invalidStart + invalidSize)
+                return true;
+        }
+        return false;
+    };
+
     // First pass: identify all block start addresses
     while (!workList.empty())
     {
@@ -5452,6 +4624,10 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
 
         // Skip if already visited
         if (visited.count(addr))
+            continue;
+        
+        // Skip if this is marked as invalid/data
+        if (isInInvalidRegion(addr))
             continue;
         
         // Get section for this address (may be different for chunks)
@@ -5486,6 +4662,10 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
             
             // Always stop at other function entry points - unless it's a chunk entry
             if (currentAddr != fn.base && functionEntryPoints.count(currentAddr) && !isInFunctionRange(currentAddr))
+                break;
+            
+            // Stop if we hit invalid/data address
+            if (isInInvalidRegion(currentAddr))
                 break;
             
             // Stop if we've gone past the effective end and hit visited code (for non-chunk code)
@@ -5656,6 +4836,13 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
                 break;
             }
             
+            // Skip if this address is marked as invalid (data, jump tables, etc.)
+            if (isInInvalidRegion(addr))
+            {
+                p++;
+                continue;
+            }
+            
             // Try to decode instruction
             x86::Insn insn;
             int len = x86::Disassemble(p, sectionEnd - p, addr, insn);
@@ -5677,7 +4864,7 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
         
         if (!newBlocks.empty())
         {
-            fmt::println("Gap scan found {} unreachable block starts in function 0x{:X}", newBlocks.size(), fn.base);
+            //fmt::println("Gap scan found {} unreachable block starts in function 0x{:X}", newBlocks.size(), fn.base);
             
             // Process newly discovered blocks through worklist to analyze control flow
             for (uint32_t blockAddr : newBlocks)
@@ -5697,6 +4884,10 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
                 // Don't process addresses that are other functions' entry points
                 if (addr != fn.base && functionEntryPoints.count(addr))
                     continue;
+                
+                // Don't process addresses marked as invalid (data)
+                if (isInInvalidRegion(addr))
+                    continue;
 
                 visited.insert(addr);
                 blockStarts.insert(addr);
@@ -5710,6 +4901,10 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
                     
                     // Stop if we hit another function's entry point
                     if (currentAddr != fn.base && functionEntryPoints.count(currentAddr))
+                        break;
+                    
+                    // Stop if we hit invalid/data address
+                    if (isInInvalidRegion(currentAddr))
                         break;
                     
                     if (currentAddr > effectiveEnd)
@@ -5783,17 +4978,17 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
                 }
             }
             
-            fmt::println("Completed worklist processing for unreachable blocks");
+            // fmt::println("Completed worklist processing for unreachable blocks");
             
-            // Debug: Show last few block starts to see if they cover the TOML range
-            std::vector<uint32_t> allStarts(blockStarts.begin(), blockStarts.end());
-            std::sort(allStarts.begin(), allStarts.end());
-            fmt::println("Total blockStarts: {}, last 5 addresses:", allStarts.size());
-            for (size_t i = allStarts.size() > 5 ? allStarts.size() - 5 : 0; i < allStarts.size(); i++)
-            {
-                fmt::println("  0x{:X}", allStarts[i]);
-            }
-            fmt::println("TOML-specified end: 0x{:X}, effectiveEnd: 0x{:X}", fn.base + scanSize, effectiveEnd);
+            // // Debug: Show last few block starts to see if they cover the TOML range
+            // std::vector<uint32_t> allStarts(blockStarts.begin(), blockStarts.end());
+            // std::sort(allStarts.begin(), allStarts.end());
+            // fmt::println("Total blockStarts: {}, last 5 addresses:", allStarts.size());
+            // for (size_t i = allStarts.size() > 5 ? allStarts.size() - 5 : 0; i < allStarts.size(); i++)
+            // {
+            //     fmt::println("  0x{:X}", allStarts[i]);
+            // }
+            // fmt::println("TOML-specified end: 0x{:X}, effectiveEnd: 0x{:X}", fn.base + scanSize, effectiveEnd);
         }
         
         // Update effectiveEnd to cover the full TOML range, but clamp to next function entry
@@ -5907,6 +5102,22 @@ X86Recompiler::ControlFlowResult X86Recompiler::AnalyzeControlFlow(const Functio
                 block.fallsThrough = false;
                 break;
 
+            case x86::InsnType::Call:
+                // Track intra-function call targets for label generation
+                if (insn.is_branch_relative)
+                {
+                    // Check if target is within function (not a known function entry point)
+                    bool targetInFunction = isInFunctionRange(insn.branch_target) ||
+                        (insn.branch_target >= effectiveBase && insn.branch_target < effectiveEnd);
+                    bool isKnownFunction = functionEntryPoints.count(insn.branch_target) > 0;
+                    
+                    if (targetInFunction && !isKnownFunction)
+                    {
+                        block.intraFunctionCallTargets.push_back(insn.branch_target);
+                    }
+                }
+                break;
+
             default:
                 break;
             }
@@ -5939,21 +5150,90 @@ std::set<uint32_t> X86Recompiler::CollectLabelAddresses(const Function& fn, cons
 {
     std::set<uint32_t> labels;
 
-    // All block starts (except first) need labels
-    for (size_t i = 1; i < blocks.size(); i++)
+    // Helper to check if an address is within the function body or its chunks
+    auto isInFunctionOrChunks = [&](uint32_t target) -> bool
     {
-        labels.insert(blocks[i].start);
-    }
+        // Check main function body
+        if (target >= effectiveBase && target < effectiveEnd)
+            return true;
+        
+        // Check chunks
+        auto chunksIt = config.functionChunks.find(fn.base);
+        if (chunksIt != config.functionChunks.end())
+        {
+            for (const auto& [chunkAddr, chunkSize] : chunksIt->second)
+            {
+                if (target >= chunkAddr && target < chunkAddr + chunkSize)
+                    return true;
+            }
+        }
+        return false;
+    };
 
-    // All conditional and unconditional jump targets within effective function range need labels
+    // Helper to check if an address is a switch table location in this function
+    auto isInFunctionSwitchLocation = [&](uint32_t addr) -> bool
+    {
+        // Check main function body
+        if (addr >= effectiveBase && addr < effectiveEnd)
+            return true;
+        
+        // Check chunks
+        auto chunksIt = config.functionChunks.find(fn.base);
+        if (chunksIt != config.functionChunks.end())
+        {
+            for (const auto& [chunkAddr, chunkSize] : chunksIt->second)
+            {
+                if (addr >= chunkAddr && addr < chunkAddr + chunkSize)
+                    return true;
+            }
+        }
+        return false;
+    };
+
+    // Only add addresses that are actually referenced by jump/branch instructions.
+    // Block starts that are only reached via fall-through don't need labels.
+
+    // Add conditional branch targets (Jcc instructions)
     for (const auto& block : blocks)
     {
-        if (block.jumpTarget >= effectiveBase && block.jumpTarget < effectiveEnd)
-            labels.insert(block.jumpTarget);
-
         for (uint32_t target : block.condTargets)
         {
-            if (target >= effectiveBase && target < effectiveEnd)
+            if (isInFunctionOrChunks(target))
+                labels.insert(target);
+        }
+    }
+
+    // Add unconditional jump targets (Jmp instructions)
+    for (const auto& block : blocks)
+    {
+        if (block.jumpTarget != 0 && isInFunctionOrChunks(block.jumpTarget))
+            labels.insert(block.jumpTarget);
+    }
+
+    // Add switch table labels
+    for (const auto& [addr, switchTable] : config.switchTables)
+    {
+        // Only add labels for switch tables within this function (including chunks)
+        if (isInFunctionSwitchLocation(addr))
+        {
+            for (uint32_t target : switchTable.labels)
+            {
+                if (isInFunctionOrChunks(target))
+                    labels.insert(target);
+            }
+            if (switchTable.defaultLabel != 0 && isInFunctionOrChunks(switchTable.defaultLabel))
+            {
+                labels.insert(switchTable.defaultLabel);
+            }
+        }
+    }
+
+    // Add intra-function call targets (calls to locations within the same function)
+    for (const auto& block : blocks)
+    {
+        for (uint32_t target : block.intraFunctionCallTargets)
+        {
+            if (isInFunctionOrChunks(target))
                 labels.insert(target);
         }
     }
@@ -6018,7 +5298,9 @@ bool X86Recompiler::Recompile(const Function& fn)
     
     auto labels = CollectLabelAddresses(fn, fnSection, blocks, effectiveBase, effectiveEnd);
     
-    // Add chunk entry points as labels if function has chunks
+    // Add chunk entry points as labels if function has chunks.
+    // These should already be captured as jump targets by CollectLabelAddresses,
+    // but we add them explicitly to ensure chunks are always labeled (they're jumped to by definition).
     if (hasChunks)
     {
         auto chunksIt = config.functionChunks.find(fn.base);
@@ -6071,15 +5353,22 @@ bool X86Recompiler::Recompile(const Function& fn)
                 println("loc_{:X}:", addr);
             }
 
-            // Check if this address is marked as invalid (likely data)
-            auto invalidIt = config.invalidAddresses.find(addr);
-            if (invalidIt != config.invalidAddresses.end())
+            // Check if this address falls within any invalid region
+            bool inInvalidRegion = false;
+            for (const auto& [invalidStart, invalidSize] : config.invalidAddresses)
             {
-                println("\t// Skipping {} bytes at {:X} (marked as invalid/data)", invalidIt->second, addr);
-                p += invalidIt->second;
-                addr += invalidIt->second;
-                continue;
+                if (addr >= invalidStart && addr < invalidStart + invalidSize)
+                {
+                    uint32_t remainingBytes = (invalidStart + invalidSize) - addr;
+                    println("\t// Skipping {} bytes at {:X} (marked as invalid/data)", remainingBytes, addr);
+                    p += remainingBytes;
+                    addr += remainingBytes;
+                    inInvalidRegion = true;
+                    break;
+                }
             }
+            if (inInvalidRegion)
+                continue;
 
             x86::Insn insn;
             int len = x86::Disassemble(p, blockEnd - p, addr, insn);
@@ -6219,7 +5508,18 @@ void X86Recompiler::Recompile(const std::filesystem::path& headerFilePath)
                 println("X86_EXTERN_FUNC({});", symbol.name);
         }
         
+        println("");
+        println("// Include stubs for functions not defined in TOML (generated after recompilation)");
+        println("#include \"x86_stubs.h\"");
+        
         SaveCurrentOutData("x86_recomp_shared.h");
+    }
+    
+    // Generate empty x86_stubs.h placeholder (will be regenerated after recompilation)
+    {
+        println("#pragma once");
+        println("// Placeholder - regenerated after recompilation with actual stubs");
+        SaveCurrentOutData("x86_stubs.h");
     }
 
     // Generate x86_func_mapping.cpp
@@ -6332,6 +5632,294 @@ void X86Recompiler::Recompile(const std::filesystem::path& headerFilePath)
     }
 
     SaveCurrentOutData();
+    
+    // Generate stubs file for undefined functions (referenced but not in TOML)
+    if (!referencedUndefinedFunctions.empty())
+    {
+        fmt::println("Generating stubs for {} undefined functions", referencedUndefinedFunctions.size());
+        
+        // First, generate a header with extern declarations
+        println("#pragma once");
+        println("");
+        println("// Forward declarations for functions that are called but not defined in TOML.");
+        println("// Include this header in your recompiled code files.");
+        println("// Either implement these functions yourself, or include x86_stubs_impl.h for no-op stubs.");
+        println("");
+        println("#include \"x86_context.h\"");
+        println("");
+        
+        for (uint32_t addr : referencedUndefinedFunctions)
+        {
+            auto targetSymbol = image.symbols.find(addr);
+            if (targetSymbol != image.symbols.end() && targetSymbol->address == addr && targetSymbol->type == Symbol_Function)
+            {
+                println("X86_EXTERN_FUNC({}); // 0x{:X}", targetSymbol->name, addr);
+            }
+            else
+            {
+                println("X86_EXTERN_FUNC(sub_{:X});", addr);
+            }
+        }
+        
+        SaveCurrentOutData("x86_stubs.h");
+        
+        // Then, generate the no-op stub implementations
+        println("#pragma once");
+        println("");
+        println("// No-op stub implementations for undefined functions.");
+        println("// Include this header ONCE in your project if you want empty stubs.");
+        println("// Alternatively, implement these functions yourself.");
+        println("");
+        println("#include \"x86_recomp_shared.h\"");
+        println("");
+        
+        for (uint32_t addr : referencedUndefinedFunctions)
+        {
+            auto targetSymbol = image.symbols.find(addr);
+            if (targetSymbol != image.symbols.end() && targetSymbol->address == addr && targetSymbol->type == Symbol_Function)
+            {
+                println("// 0x{:X}: {}", addr, targetSymbol->name);
+                println("X86_STUB_FUNC({});", targetSymbol->name);
+            }
+            else
+            {
+                println("// 0x{:X}", addr);
+                println("X86_STUB_FUNC(sub_{:X});", addr);
+            }
+            println("");
+        }
+        
+        SaveCurrentOutData("x86_stubs_impl.h");
+    }
+    
+    // Generate x86_main.cpp - loads XBE and sets up memory mapping
+    {
+        println("#include \"x86_recomp_shared.h\"");
+        println("#include <cstdio>");
+        println("#include <cstdlib>");
+        println("#include <cstring>");
+        println("");
+        println("#ifdef _WIN32");
+        println("#include <windows.h>");
+        println("#else");
+        println("#include <sys/mman.h>");
+        println("#include <fcntl.h>");
+        println("#include <unistd.h>");
+        println("#endif");
+        println("");
+        println("// XBE header structures");
+        println("struct XbeHeader {{");
+        println("\tuint32_t magic;");
+        println("\tuint8_t  signature[256];");
+        println("\tuint32_t baseAddress;");
+        println("\tuint32_t headersSize;");
+        println("\tuint32_t imageSize;");
+        println("\tuint32_t imageHeaderSize;");
+        println("\tuint32_t timestamp;");
+        println("\tuint32_t certificateAddress;");
+        println("\tuint32_t sectionCount;");
+        println("\tuint32_t sectionHeadersAddress;");
+        println("\tuint32_t initFlags;");
+        println("\tuint32_t entryPoint;");
+        println("}};");
+        println("");
+        println("struct XbeSectionHeader {{");
+        println("\tuint32_t flags;");
+        println("\tuint32_t virtualAddress;");
+        println("\tuint32_t virtualSize;");
+        println("\tuint32_t rawAddress;");
+        println("\tuint32_t rawSize;");
+        println("\tuint32_t sectionNameAddress;");
+        println("\tuint32_t sectionNameRefCount;");
+        println("\tuint32_t headSharedPageRefCountAddress;");
+        println("\tuint32_t tailSharedPageRefCountAddress;");
+        println("\tuint8_t  sectionDigest[20];");
+        println("}};");
+        println("");
+        println("static uint8_t* g_xbeMemory = nullptr;");
+        println("static size_t g_xbeMemorySize = 0;");
+        println("static uint8_t* g_stackBase = nullptr;");
+        println("static uint8_t* g_stackTop = nullptr;");
+        println("");
+        println("bool LoadXbe(const char* xbePath)");
+        println("{{");
+        println("\tFILE* f = fopen(xbePath, \"rb\");");
+        println("\tif (!f)");
+        println("\t{{");
+        println("\t\tfprintf(stderr, \"Failed to open XBE file: %s\\n\", xbePath);");
+        println("\t\treturn false;");
+        println("\t}}");
+        println("");
+        println("\t// Read XBE header");
+        println("\tXbeHeader header;");
+        println("\tif (fread(&header, sizeof(header), 1, f) != 1)");
+        println("\t{{");
+        println("\t\tfprintf(stderr, \"Failed to read XBE header\\n\");");
+        println("\t\tfclose(f);");
+        println("\t\treturn false;");
+        println("\t}}");
+        println("");
+        println("\t// Verify magic");
+        println("\tif (header.magic != 0x48454258) // \"XBEH\"");
+        println("\t{{");
+        println("\t\tfprintf(stderr, \"Invalid XBE magic\\n\");");
+        println("\t\tfclose(f);");
+        println("\t\treturn false;");
+        println("\t}}");
+        println("");
+        println("\t// Allocate memory for the entire image");
+        println("\tg_xbeMemorySize = header.imageSize;");
+        println("");
+        println("#ifdef _WIN32");
+        println("\tg_xbeMemory = (uint8_t*)VirtualAlloc(nullptr, g_xbeMemorySize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);");
+        println("#else");
+        println("\tg_xbeMemory = (uint8_t*)mmap(nullptr, g_xbeMemorySize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);");
+        println("\tif (g_xbeMemory == MAP_FAILED) g_xbeMemory = nullptr;");
+        println("#endif");
+        println("");
+        println("\tif (!g_xbeMemory)");
+        println("\t{{");
+        println("\t\tfprintf(stderr, \"Failed to allocate memory for XBE image\\n\");");
+        println("\t\tfclose(f);");
+        println("\t\treturn false;");
+        println("\t}}");
+        println("");
+        println("\t// Zero out memory");
+        println("\tmemset(g_xbeMemory, 0, g_xbeMemorySize);");
+        println("");
+        println("\t// Copy headers (at offset 0 in our buffer, they map to baseAddress in virtual space)");
+        println("\tfseek(f, 0, SEEK_SET);");
+        println("\tfread(g_xbeMemory, header.headersSize, 1, f);");
+        println("");
+        println("\t// Read section headers and load sections");
+        println("\tuint32_t sectionHeadersOffset = header.sectionHeadersAddress - header.baseAddress;");
+        println("\tfor (uint32_t i = 0; i < header.sectionCount; i++)");
+        println("\t{{");
+        println("\t\tXbeSectionHeader sectionHeader;");
+        println("\t\tfseek(f, sectionHeadersOffset + i * sizeof(XbeSectionHeader), SEEK_SET);");
+        println("\t\tif (fread(&sectionHeader, sizeof(sectionHeader), 1, f) != 1)");
+        println("\t\t\tcontinue;");
+        println("");
+        println("\t\t// Load section data (virtualAddress is absolute, subtract baseAddress to get buffer offset)");
+        println("\t\tif (sectionHeader.rawSize > 0 && sectionHeader.rawAddress > 0)");
+        println("\t\t{{");
+        println("\t\t\tfseek(f, sectionHeader.rawAddress, SEEK_SET);");
+        println("\t\t\tuint32_t loadSize = (sectionHeader.rawSize < sectionHeader.virtualSize) ? sectionHeader.rawSize : sectionHeader.virtualSize;");
+        println("\t\t\tuint32_t bufferOffset = sectionHeader.virtualAddress - header.baseAddress;");
+        println("\t\t\tif (bufferOffset + loadSize <= g_xbeMemorySize)");
+        println("\t\t\t\tfread(g_xbeMemory + bufferOffset, loadSize, 1, f);");
+        println("\t\t}}");
+        println("\t}}");
+        println("");
+        println("\tfclose(f);");
+        println("\treturn true;");
+        println("}}");
+        println("");
+        println("void UnloadXbe()");
+        println("{{");
+        println("\tif (g_xbeMemory)");
+        println("\t{{");
+        println("#ifdef _WIN32");
+        println("\t\tVirtualFree(g_xbeMemory, 0, MEM_RELEASE);");
+        println("#else");
+        println("\t\tmunmap(g_xbeMemory, g_xbeMemorySize);");
+        println("#endif");
+        println("\t\tg_xbeMemory = nullptr;");
+        println("\t\tg_xbeMemorySize = 0;");
+        println("\t}}");
+        println("}}");
+        println("");
+        println("uint8_t* GetXbeBase()");
+        println("{{");
+        println("\treturn g_xbeMemory;");
+        println("}}");
+        println("");
+        println("// Entry point - customize as needed");
+        println("int main(int argc, char* argv[])");
+        println("{{");
+        println("\tconst char* xbePath = (argc > 1) ? argv[1] : \"default.xbe\";");
+        println("");
+        println("\tif (!LoadXbe(xbePath))");
+        println("\t{{");
+        println("\t\tfprintf(stderr, \"Failed to load XBE\\n\");");
+        println("\t\treturn 1;");
+        println("\t}}");
+        println("");
+        println("\tprintf(\"XBE loaded at base %p (size: 0x%zx)\\n\", g_xbeMemory, g_xbeMemorySize);");
+        println("");
+        println("\t// Get entry point from XBE header (stored at offset 0 in our buffer)");
+        println("\tXbeHeader* xbeHeader = (XbeHeader*)g_xbeMemory;");
+        println("\tuint32_t entryPoint = xbeHeader->entryPoint ^ 0xA8FC57AB; // Retail XOR key");
+        println("\tprintf(\"Entry point: 0x%%08X\\n\", entryPoint);");
+        println("");
+        println("\t// Allocate stack (1MB default, growing downward)");
+        println("\tconst size_t stackSize = 1024 * 1024;");
+        println("\tuint8_t* stackBase = (uint8_t*)malloc(stackSize);");
+        println("\tif (!stackBase)");
+        println("\t{{");
+        println("\t\tfprintf(stderr, \"Failed to allocate stack\\n\");");
+        println("\t\tUnloadXbe();");
+        println("\t\treturn 1;");
+        println("\t}}");
+        println("\tmemset(stackBase, 0, stackSize);");
+        println("");
+        println("\t// Stack pointer starts at top of stack (stack grows down)");
+        println("\t// Align to 16 bytes for SSE operations");
+        println("\tuint32_t stackTop = (uint32_t)(uintptr_t)(stackBase + stackSize);");
+        println("\tstackTop &= ~0xFu; // 16-byte align");
+        println("");
+        println("\t// Initialize CPU context");
+        println("\tX86Context ctx{{}};");
+        println("");
+        println("\t// Base pointer adjusted so that (base + virtualAddress) maps correctly");
+        println("\t// Virtual addresses are absolute (starting at baseAddress), but our buffer stores");
+        println("\t// data at (virtualAddress - baseAddress). So base = g_xbeMemory - baseAddress.");
+        println("\tuint8_t* base = g_xbeMemory - 0x{:X};", image.base);
+        println("");
+        println("\t// For stack operations, we need the stack to also be accessible via base+offset,");
+        println("\t// but we allocated it separately. For now, store stack pointer directly.");
+        println("\t// Note: If recompiled code uses (base + esp), stack needs to be in XBE address space.");
+        println("\tg_stackBase = stackBase; // Store for later access");
+        println("\tg_stackTop = (uint8_t*)(stackBase + stackSize);");
+        println("");
+        println("\t// Set up initial register state");
+        println("\tctx.eax.u32 = 0;");
+        println("\tctx.ebx.u32 = 0;");
+        println("\tctx.ecx.u32 = 0;");
+        println("\tctx.edx.u32 = 0;");
+        println("\tctx.esi.u32 = 0;");
+        println("\tctx.edi.u32 = 0;");
+        println("\tctx.esp.u32 = stackTop;");
+        println("\tctx.ebp.u32 = stackTop;");
+        println("");
+        println("\t// Initialize FPU state (default values)");
+        println("\tmemset(&ctx.fpu, 0, sizeof(ctx.fpu));");
+        println("\tctx.fpu.tags.tags = 0xFFFF; // All registers empty");
+        println("");
+        println("\t// Clear flags");
+        println("\tctx.eflags.cf = 0;");
+        println("\tctx.eflags.pf = 0;");
+        println("\tctx.eflags.af = 0;");
+        println("\tctx.eflags.zf = 0;");
+        println("\tctx.eflags.sf = 0;");
+        println("\tctx.eflags.of = 0;");
+        println("\tctx.eflags.df = 0;");
+        println("");
+        println("\t// Note: Stack operations in recompiled code use (base + esp) pattern");
+        println("\t// This requires the stack to be mapped appropriately, or a custom PUSH/POP");
+        println("");
+        println("\t// TODO: Call entry point or specific function");
+        println("\t// The entry point function should be: sub_XXXX where XXXX is entryPoint");
+        println("\tprintf(\"Ready to execute. Call the appropriate entry function.\\n\");");
+        println("\t// Example: sub_{:X}(ctx, base);", image.entry_point);
+        println("");
+        println("\tfree(stackBase);");
+        println("\tUnloadXbe();");
+        println("\treturn 0;");
+        println("}}");
+        
+        SaveCurrentOutData("x86_main.cpp");
+    }
 }
 
 void X86Recompiler::SaveCurrentOutData(const std::string_view& name)

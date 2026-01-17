@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 #include <x86/avx.h>
 #include <x86/sse.h>
@@ -22,9 +23,10 @@
 #define X86_XSTRINGIFY(x) #x
 #define X86_STRINGIFY(x) X86_XSTRINGIFY(x)
 #define X86_FUNC(x) void x(X86Context& __restrict ctx, uint8_t* base)
-#define X86_FUNC_IMPL(x) extern "C" X86_FUNC(x)
+#define X86_FUNC_IMPL(x) extern X86_FUNC(x)
 #define X86_EXTERN_FUNC(x) extern X86_FUNC(x)
 #define X86_WEAK_FUNC(x) __attribute__((weak,noinline)) X86_FUNC(x)
+#define X86_STUB_FUNC(x) inline X86_FUNC(x) { X86_FUNC_PROLOGUE(); /* stub - not implemented */ }
 
 #define X86_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0xF) == 0)
 

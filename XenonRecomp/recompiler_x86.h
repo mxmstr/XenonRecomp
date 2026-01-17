@@ -31,6 +31,7 @@ struct X86BasicBlock
     bool fallsThrough = false;  // Block falls through to next
     uint32_t jumpTarget = 0;    // Target of unconditional jump (if any)
     std::vector<uint32_t> condTargets;  // Conditional branch targets
+    std::vector<uint32_t> intraFunctionCallTargets;  // Call targets within same function (need labels)
 };
 
 struct X86Recompiler
@@ -38,6 +39,7 @@ struct X86Recompiler
     Image image;
     std::vector<Function> functions;
     std::set<uint32_t> functionEntryPoints;  // All function entry addresses for tail call detection
+    std::set<uint32_t> referencedUndefinedFunctions;  // Functions called but not defined in TOML (need stubs)
     std::string out;
     size_t cppFileIndex = 0;
     X86RecompilerConfig config;

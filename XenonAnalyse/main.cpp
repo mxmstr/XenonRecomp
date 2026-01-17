@@ -422,7 +422,7 @@ int main(int argc, char** argv)
         std::replace(inputFilePath.begin(), inputFilePath.end(), '\\', '/');
         
         println("file_path = \"{}\"", inputFilePath);
-        println("out_directory_path = \"./x86_out\"");
+        println("out_directory_path = \"x86_out\"");
         if (!allTables.empty())
         {
             println("switch_table_file_path = \"{}\"", switchTableFileName);
