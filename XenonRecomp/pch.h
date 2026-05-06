@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cmath>
 #include <charconv>
 #include <disasm.h>
 #include <file.h>

@@ -1,10 +1,17 @@
 # XenonRecomp
 
-XenonRecomp is a tool that converts Xbox 360 executables into C++ code, which can then be recompiled for any platform.
+XenonRecomp is a tool that converts Xbox 360 and Original Xbox executables into C++ code, which can then be recompiled for any platform.
 
 This project was heavily inspired by [N64: Recompiled](https://github.com/N64Recomp/N64Recomp), a similar tool for N64 executables.
 
 **DISCLAIMER:** This project does not provide a runtime implementation. It only converts the game code to C++, which is not going to function correctly without a runtime backing it. **Making the game work is your responsibility.**
+
+## Supported Platforms
+
+Platform|Executable Format|Architecture|Status
+-|-|-|-
+Xbox 360|XEX|PowerPC (PPC)|Fully supported
+Original Xbox|XBE|x86|Experimental
 
 ## Implementation Details
 
@@ -86,11 +93,13 @@ Additionally, mid-asm hooks can be inserted directly into the translated C++ cod
 
 ### XenonAnalyse
 
-XenonAnalyse, when used as a command-line application, allows an XEX file to be passed as an input argument to output a TOML file containing all the detected jump tables in the executable:
+XenonAnalyse, when used as a command-line application, allows an XEX or XBE file to be passed as an input argument to output a TOML file containing all the detected jump tables in the executable:
 
 ```
-XenonAnalyse [input XEX file path] [output jump table TOML file path]
+XenonAnalyse [input XEX/XBE file path] [output jump table TOML file path]
 ```
+
+The tool automatically detects the executable format (XEX for Xbox 360, XBE for Original Xbox) based on the file header.
 
 However, as explained in the earlier sections, due to variations between games, additional support may be needed to handle different patterns.
 
@@ -98,11 +107,15 @@ However, as explained in the earlier sections, due to variations between games, 
 
 ### XenonRecomp
 
-XenonRecomp accepts a TOML file with recompiler configurations and the path to the `ppc_context.h` file located in the XenonUtils directory:
+XenonRecomp accepts a TOML file with recompiler configurations and the path to the context header file located in the XenonUtils directory:
 
 ```
-XenonRecomp [input TOML file path] [input PPC context header file path]
+XenonRecomp [input TOML file path] [context header file path]
 ```
+
+For Xbox 360 (XEX) files, use `ppc_context.h`. For Original Xbox (XBE) files, use `x86_context.h`.
+
+The recompiler automatically detects the executable type based on the `file_path` in the TOML configuration.
 
 [An example recompiler TOML file can be viewed in the Unleashed Recompiled repository.](https://github.com/hedge-dev/UnleashedRecomp/blob/main/UnleashedRecompLib/config/SWA.toml)
 
@@ -236,6 +249,98 @@ jump_address_on_false|The address to jump to if the mid-asm hook returns `false`
 after_instruction|Set to `true` to place the mid-asm hook immediately after the instruction, instead of before.
 
 Certain properties are mutually exclusive. For example, you cannot use both `return` and `jump_address`, and direct or conditional returns/jumps cannot be mixed. The recompiler is going to show warnings if this is not followed.
+
+### XBE Configuration (Original Xbox)
+
+For Original Xbox (XBE) files, the TOML configuration uses a similar but simplified structure:
+
+#### Main (XBE)
+
+```toml
+[main]
+file_path = "../private/default.xbe"
+out_directory_path = "../x86"
+switch_table_file_path = "game_switch_tables.toml"
+```
+
+Property|Description
+-|-
+file_path|Path to the XBE file.
+out_directory_path|Path to the directory that will contain the output C++ code. This directory must exist before running the recompiler.
+switch_table_file_path|Path to the TOML file containing the jump table definitions.
+
+#### Optimizations (XBE)
+
+```toml
+eax_as_local = false
+ecx_as_local = false
+edx_as_local = false
+ebx_as_local = false
+esi_as_local = false
+edi_as_local = false
+eflags_as_local = false
+fpu_as_local = false
+```
+
+Enables or disables register-to-local-variable optimizations. It is recommended not to enable these until you have a successfully running recompilation.
+
+#### Special Functions (XBE)
+
+```toml
+longjmp_address = 0x00000000
+setjmp_address = 0x00000000
+alloca_probe_address = 0x00000000
+seh_prolog_address = 0x00000000
+seh_epilog_address = 0x00000000
+```
+
+Property|Description
+-|-
+longjmp_address|Address of the `longjmp` function.
+setjmp_address|Address of the `setjmp` function.
+alloca_probe_address|Address of the `_alloca_probe` or `_chkstk` function used for stack probing.
+seh_prolog_address|Address of SEH prolog helper function.
+seh_epilog_address|Address of SEH epilog helper function.
+
+#### Explicit Function Boundaries (XBE)
+
+```toml
+functions = [
+    { address = 0x00012000, size = 0x100 },
+    { address = 0x00012100, size = 0x80 },
+]
+```
+
+Same as XEX - you can define function boundaries explicitly if automatic analysis fails.
+
+#### Invalid Instruction Skips (XBE)
+
+```toml
+invalid_instructions = [
+    { data = 0xCCCCCCCC, size = 4 }, # INT3 padding
+    { data = 0x00000000, size = 4 }, # NOP padding
+]
+```
+
+Same as XEX - skip over padding and non-code bytes.
+
+#### Mid-asm Hooks (XBE)
+
+```toml
+[[midasm_hook]]
+name = "SomeHookFunction"
+address = 0x00012345
+registers = ["eax", "ecx"]
+```
+
+```cpp
+void SomeHookFunction(uint32_t& eax, uint32_t& ecx)
+{
+    // ...
+}
+```
+
+Same structure as XEX mid-asm hooks, but with x86 register names (eax, ebx, ecx, edx, esi, edi, ebp, esp).
 
 ### Tests
 

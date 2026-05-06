@@ -2602,18 +2602,36 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
         SaveCurrentOutData("ppc_func_mapping.cpp");
     }
 
+    size_t functionsRecompiled = 0;
     for (size_t i = 0; i < functions.size(); i++)
     {
-        if ((i % 256) == 0)
+        // If single function mode, skip all others
+        if (config.singleFunctionAddress != 0 && functions[i].base != config.singleFunctionAddress)
+            continue;
+
+        if ((functionsRecompiled % 256) == 0)
         {
             SaveCurrentOutData();
             println("#include \"ppc_recomp_shared.h\"\n");
         }
 
-        if ((i % 2048) == 0 || (i == (functions.size() - 1)))
+        if (config.singleFunctionAddress == 0 && ((i % 2048) == 0 || (i == (functions.size() - 1))))
             fmt::println("Recompiling functions... {}%", static_cast<float>(i + 1) / functions.size() * 100.0f);
 
         Recompile(functions[i]);
+        functionsRecompiled++;
+
+        // If single function mode and we found it, we're done
+        if (config.singleFunctionAddress != 0)
+        {
+            fmt::println("Successfully recompiled function at 0x{:X}", config.singleFunctionAddress);
+            break;
+        }
+    }
+
+    if (config.singleFunctionAddress != 0 && functionsRecompiled == 0)
+    {
+        fmt::println("ERROR: Function at address 0x{:X} not found in symbol table", config.singleFunctionAddress);
     }
 
     SaveCurrentOutData();

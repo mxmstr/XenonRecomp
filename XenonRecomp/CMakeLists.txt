@@ -5,8 +5,10 @@ project("XenonRecomp")
 add_executable(XenonRecomp 
     "main.cpp" 
     "recompiler.cpp"
-    "test_recompiler.cpp" 
-    "recompiler_config.cpp")
+    "recompiler_x86.cpp"
+    "recompiler_config.cpp"
+    "recompiler_config_x86.cpp"
+    "test_recompiler.cpp")
 
 target_precompile_headers(XenonRecomp PUBLIC "pch.h")
 
