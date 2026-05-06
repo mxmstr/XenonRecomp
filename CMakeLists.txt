@@ -1,4 +1,4 @@
-cmake_minimum_required (VERSION 3.20)
+cmake_minimum_required (VERSION 3.25)
 
 set(THIRDPARTY_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty)
 
@@ -17,12 +17,16 @@ add_subdirectory(${THIRDPARTY_ROOT})
 set(XENONANALYSE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/XenonAnalyse)
 set(XENONUTILS_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/XenonUtils)
 set(XENONRECOMP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/XenonRecomp)
+set(XBEANALYSE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/XBEAnalyse)
+set(XBERECOMP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/XBERecomp)
 
 project ("XenonRecomp-ALL")
 
 add_subdirectory(${XENONANALYSE_ROOT})
 add_subdirectory(${XENONRECOMP_ROOT})
 add_subdirectory(${XENONUTILS_ROOT})
+add_subdirectory(${XBEANALYSE_ROOT})
+add_subdirectory(${XBERECOMP_ROOT})
 
 # Only tests if this is the top level project
 if (${CMAKE_CURRENT_SOURCE_DIR} STREQUAL ${CMAKE_SOURCE_DIR})
